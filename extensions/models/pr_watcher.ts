@@ -777,7 +777,7 @@ async function runInvestigation(
  */
 export const model = {
   type: "@mgreten/pr-watcher",
-  version: "2026.06.26.3",
+  version: "2026.06.27.1",
   globalArguments: GlobalArgsSchema,
   resources: {
     investigation: {

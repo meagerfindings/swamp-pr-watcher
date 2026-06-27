@@ -1,6 +1,6 @@
 manifestVersion: 1
 name: "@mgreten/pr-watcher"
-version: "2026.06.26.3"
+version: "2026.06.27.1"
 description: >
   Autonomous PR-feedback investigation engine: watch a feed of pull-request
   feedback, spawn a coding agent to investigate each PR against its diff,
