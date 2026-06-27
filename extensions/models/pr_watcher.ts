@@ -70,6 +70,12 @@ const GlobalArgsSchema = z.object({
    * `approve` + `executeWorktreeFix`. Distinct from `ntfyTopic` so the poll
    * feed isn't polluted by outbound notifications. */
   approvalTopic: z.string().default("pr-approvals"),
+  /** When true, `executeWorktreeFix` does NOT emit its own success/failure ntfy
+   * notification — the fixRun artifact it returns carries `success`/`summary`/
+   * `prUrl` so a caller (bridge) can deliver the notification itself (e.g. to
+   * apply quiet-hours deferral the generic engine shouldn't bake in). The
+   * fix still runs and is audited identically. */
+  suppressFixNotifications: z.boolean().default(false),
 });
 
 /** A single action the investigation agent proposes for a piece of feedback. */
@@ -771,7 +777,7 @@ async function runInvestigation(
  */
 export const model = {
   type: "@mgreten/pr-watcher",
-  version: "2026.06.26.2",
+  version: "2026.06.26.3",
   globalArguments: GlobalArgsSchema,
   resources: {
     investigation: {
@@ -1257,6 +1263,7 @@ export const model = {
           repoPath,
           worktreeModel,
           phaseRunnerModel,
+          suppressFixNotifications,
         } = context.globalArgs;
         const repoDir = resolveRepoDir();
 
@@ -1444,7 +1451,9 @@ export const model = {
           // ship). The cheap early failures (worktree-add, fetch, checkout)
           // have nothing to salvage, so those still clean up.
           const resumable = ["build", "test", "ship"].includes(phase);
-          await notifyFixFailure(phase, resumable);
+          if (!suppressFixNotifications) {
+            await notifyFixFailure(phase, resumable);
+          }
           return await finalize(resumable);
         };
 
@@ -1590,7 +1599,7 @@ export const model = {
           { prNumber: investigation.prNumber, branch: headBranch },
         );
 
-        await notifyFixSuccess();
+        if (!suppressFixNotifications) await notifyFixSuccess();
         return await finalize(false);
       },
     },
