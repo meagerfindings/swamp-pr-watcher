@@ -174,6 +174,17 @@ export function resolveRepoDir(): string {
 }
 
 /**
+ * Make a string safe to use as an HTTP header value. `fetch()` requires header
+ * values to be ByteStrings (code points ≤ 255); any emoji or wider Unicode in a
+ * dynamic value (e.g. a PR title) otherwise throws "not a valid ByteString" and
+ * silently kills the whole notification. Characters outside Latin-1 are dropped.
+ */
+export function asciiHeader(value: string): string {
+  // deno-lint-ignore no-control-regex
+  return value.replace(/[^\x00-\xFF]/g, "").replace(/[\r\n]/g, " ").trim();
+}
+
+/**
  * Invoke the CLI-agent model (`invoke` or `invokeAndParse`) and normalize its
  * envelope into `{ success, output, error }`.
  */
@@ -760,7 +771,7 @@ async function runInvestigation(
  */
 export const model = {
   type: "@mgreten/pr-watcher",
-  version: "2026.06.26.1",
+  version: "2026.06.26.2",
   globalArguments: GlobalArgsSchema,
   resources: {
     investigation: {
@@ -939,8 +950,14 @@ export const model = {
         // to the approvals topic. A poller drains that topic and runs approve +
         // executeWorktreeFix where the worktree/build toolchain lives. ntfy
         // caps actions at 3.
+        //
+        // The action LABEL must stay ASCII: it travels in the `Actions` HTTP
+        // header, and fetch() rejects any header value with a code point > 255
+        // ("not a valid ByteString"). An emoji in the label silently breaks
+        // every notification. Emoji belong in the message body or as ntfy tag
+        // NAMES (see `Tags`), never in a header value.
         const approveAction =
-          `http, ✅ Approve, ${ntfyBaseUrl}/${approvalTopic}, method=POST, ` +
+          `http, Approve, ${ntfyBaseUrl}/${approvalTopic}, method=POST, ` +
           `body=${args.investigationId}, clear=true`;
         const viewAction = `view, View PR, ${investigation.prUrl}, clear=true`;
         const actions = [approveAction, viewAction].join("; ");
@@ -951,10 +968,10 @@ export const model = {
           const response = await fetch(ntfyUrl, {
             method: "POST",
             headers: {
-              "Title": title,
+              "Title": asciiHeader(title),
               "Priority": String(priority),
-              "Tags": tagList,
-              "Actions": actions,
+              "Tags": asciiHeader(tagList),
+              "Actions": asciiHeader(actions),
               "Click": investigation.prUrl,
             },
             body: message,
@@ -1395,8 +1412,11 @@ export const model = {
             await fetch(`${ntfyBaseUrl}/${ntfyTopic}`, {
               method: "POST",
               headers: {
-                "Title":
-                  `❌ PR #${investigation.prNumber} fix FAILED at ${phase}`,
+                // Title stays ASCII (HTTP header = ByteString). The `x` tag
+                // below renders the ❌ emoji in the ntfy client.
+                "Title": asciiHeader(
+                  `PR #${investigation.prNumber} fix FAILED at ${phase}`,
+                ),
                 "Priority": "4",
                 "Tags": ntfyExtraTag ? `x,${ntfyExtraTag}` : "x",
                 "Click": investigation.prUrl,
@@ -1437,7 +1457,9 @@ export const model = {
             await fetch(`${ntfyBaseUrl}/${ntfyTopic}`, {
               method: "POST",
               headers: {
-                "Title": `✅ PR #${investigation.prNumber} fix pushed`,
+                // Title stays ASCII (HTTP header = ByteString). The
+                // white_check_mark tag renders the ✅ emoji in the ntfy client.
+                "Title": `PR #${investigation.prNumber} fix pushed`,
                 "Priority": "3",
                 "Tags": ntfyExtraTag
                   ? `white_check_mark,${ntfyExtraTag}`

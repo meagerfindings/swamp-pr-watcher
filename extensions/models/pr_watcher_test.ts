@@ -9,10 +9,34 @@
 
 import { assert, assertEquals, assertStringIncludes } from "jsr:@std/assert@1";
 import {
+  asciiHeader,
   buildInvestigationPrompt,
   type FeedbackEvent,
   resolveRepoDir,
 } from "./pr_watcher.ts";
+
+// --- asciiHeader ------------------------------------------------------------
+
+Deno.test("asciiHeader strips emoji so the value is a valid ByteString", () => {
+  const cleaned = asciiHeader("✅ Approve");
+  assertEquals(cleaned, "Approve");
+  // Every remaining code point must fit in a ByteString (<= 0xFF).
+  for (const ch of cleaned) assert(ch.codePointAt(0)! <= 0xff);
+});
+
+Deno.test("asciiHeader keeps Latin-1 text and collapses newlines", () => {
+  assertEquals(asciiHeader("PR #42 fix FAILED at build"), "PR #42 fix FAILED at build");
+  assertEquals(asciiHeader("line1\nline2"), "line1 line2");
+});
+
+Deno.test("asciiHeader output never throws when used as a fetch header", () => {
+  const dirty = "🚀 PR — café build ❌";
+  const cleaned = asciiHeader(dirty);
+  // Construct a Headers object — this is exactly what fetch() validates.
+  const h = new Headers();
+  h.set("Title", cleaned); // must not throw
+  assertEquals(h.get("Title"), cleaned);
+});
 
 // --- Fixtures ---------------------------------------------------------------
 
