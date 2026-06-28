@@ -107,7 +107,7 @@ const InvestigationSchema = z.object({
   }),
   hasHumanFeedback: z.boolean(),
   investigatedAt: z.string(),
-}).passthrough();
+});
 
 /** An operator decision recorded against an investigation. */
 const ActionSchema = z.object({
@@ -119,7 +119,7 @@ const ActionSchema = z.object({
   userNote: z.string().optional(),
   executedAt: z.string().optional(),
   executionResult: z.string().optional(),
-}).passthrough();
+});
 
 /** Audit record of one worktree-isolated autonomous fix attempt. */
 const FixRunSchema = z.object({
@@ -142,7 +142,7 @@ const FixRunSchema = z.object({
   prUrl: z.string().optional(),
   startedAt: z.string(),
   finishedAt: z.string().optional(),
-}).passthrough();
+});
 
 /** Result of a shelled subprocess invocation. */
 type CmdResult = {
@@ -777,7 +777,7 @@ async function runInvestigation(
  */
 export const model = {
   type: "@mgreten/pr-watcher",
-  version: "2026.06.27.1",
+  version: "2026.06.27.2",
   globalArguments: GlobalArgsSchema,
   resources: {
     investigation: {
