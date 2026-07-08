@@ -41,6 +41,13 @@ const GlobalArgsSchema = z.object({
   repoDescription: z.string().default(""),
   /** Name of the @mgreten/cli-agent (or compatible) model to invoke. */
   cliAgentModel: z.string().default("cli-agent"),
+  /** Repo dir for CROSS-REPO sub-calls (cliAgentModel, worktreeModel,
+   * phaseRunnerModel) when those instances live in a different swamp repo
+   * than this model. Falls back to the ambient repo dir when empty. Needed
+   * under a filesystem datastore, which has no catalog pull: a foreign model
+   * name only resolves from its own repo's model files. Feed reads always
+   * use the ambient repo dir (the feed lives beside this model). */
+  subCallRepoDir: z.string().default(""),
   /** ntfy topic for outbound investigation / fix notifications. */
   ntfyTopic: z.string().default("pr-watch"),
   /** Base URL of the ntfy server. */
@@ -655,9 +662,12 @@ async function runInvestigation(
     investigateProvider,
     investigateModelId,
     investigateTimeoutMs,
+    subCallRepoDir,
   } = context.globalArgs;
 
   const repoDir = resolveRepoDir();
+  // cli-agent may live in a different repo (see subCallRepoDir docs).
+  const agentRepoDir = subCallRepoDir || repoDir;
 
   context.logger.info(
     "Loading feedback events for PR #{prNumber} from {feed}",
@@ -705,7 +715,7 @@ async function runInvestigation(
 
   const agentResult = await invokeCliAgent(
     cliAgentModel,
-    repoDir,
+    agentRepoDir,
     {
       prompt,
       provider: investigateProvider,
@@ -777,7 +787,7 @@ async function runInvestigation(
  */
 export const model = {
   type: "@mgreten/pr-watcher",
-  version: "2026.06.27.2",
+  version: "2026.07.08.1",
   globalArguments: GlobalArgsSchema,
   resources: {
     investigation: {
@@ -1264,8 +1274,12 @@ export const model = {
           worktreeModel,
           phaseRunnerModel,
           suppressFixNotifications,
+          subCallRepoDir,
         } = context.globalArgs;
         const repoDir = resolveRepoDir();
+        // worktree/phase-runner may live in a different repo (see
+        // subCallRepoDir docs). Feed reads below keep the ambient repoDir.
+        const toolRepoDir = subCallRepoDir || repoDir;
 
         // Capability gate: autonomous fixes require both helper models.
         if (!worktreeModel || !phaseRunnerModel) {
@@ -1373,7 +1387,7 @@ export const model = {
               worktreeModel,
               "remove",
               { identifier: worktreeId },
-              repoDir,
+              toolRepoDir,
             );
             fixRun.worktreeRemoved = rm.success;
             if (!rm.success) {
@@ -1503,7 +1517,7 @@ export const model = {
           worktreeModel,
           "add",
           { identifier: worktreeId },
-          repoDir,
+          toolRepoDir,
         );
         if (!add.success) {
           return await fail("worktree-add", add.error ?? "unknown");
@@ -1554,7 +1568,7 @@ export const model = {
           phaseRunnerModel,
           "build",
           { prompt: fixInstruction, repoPath: worktreePath },
-          repoDir,
+          toolRepoDir,
         );
         fixRun.buildOk = build.success;
         if (!build.success) {
@@ -1566,7 +1580,7 @@ export const model = {
           phaseRunnerModel,
           "test",
           { repoPath: worktreePath, baseBranch: `origin/${headBranch}` },
-          repoDir,
+          toolRepoDir,
         );
         fixRun.testOk = test.success;
         if (!test.success) {
@@ -1578,7 +1592,7 @@ export const model = {
           phaseRunnerModel,
           "ship",
           { branchName: headBranch, repoPath: worktreePath },
-          repoDir,
+          toolRepoDir,
         );
         fixRun.shipOk = ship.success;
         if (!ship.success) {
