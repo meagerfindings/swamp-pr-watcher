@@ -204,9 +204,20 @@ export function asciiHeader(value: string): string {
  * failures are eligible to fall back to the shellout — a genuine execution
  * failure (e.g. the LLM call itself failed) must surface as-is so we never
  * double-execute an agent invocation.
+ *
+ * Argument-validation failures are included because they are thrown BEFORE
+ * the invoked method body runs — no agent work happened, so falling back
+ * cannot double-execute. This is also the safety net for the known swamp
+ * "runModel argument-threading issue" (CLI 20260710): `runModel` `arguments`
+ * land only in the child's globalArgs and are not routed to a method-level
+ * `arguments` schema, so a target whose payload is a method argument (like
+ * cli-agent's `prompt`) fails validation — by-definition form as "Method
+ * arguments validation failed", by-type form as "Global arguments validation
+ * failed: Unknown argument(s)" — and correctly falls back to the shellout
+ * until the upstream arg-threading fix ships.
  */
 export function isRunModelResolutionFailure(message: string): boolean {
-  return /not found|cannot invoke model type|Cannot verify dependencies|add .* to dependencies|Maximum cross-model invocation/i
+  return /not found|cannot invoke model type|Cannot verify dependencies|add .* to dependencies|Maximum cross-model invocation|arguments validation failed|unknown argument/i
     .test(message);
 }
 
@@ -915,7 +926,7 @@ async function runInvestigation(
  */
 export const model = {
   type: "@mgreten/pr-watcher",
-  version: "2026.07.10.1",
+  version: "2026.07.10.2",
   globalArguments: GlobalArgsSchema,
   resources: {
     investigation: {
