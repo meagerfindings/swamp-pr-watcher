@@ -208,7 +208,8 @@ export function asciiHeader(value: string): string {
  * Argument-validation failures are included because they are thrown BEFORE
  * the invoked method body runs — no agent work happened, so falling back
  * cannot double-execute. This is also the safety net for the known swamp
- * "runModel argument-threading issue" (CLI 20260710): `runModel` `arguments`
+ * "runModel argument-threading issue" (swamp-club Lab #1080, CLI 20260710):
+ * `runModel` `arguments`
  * land only in the child's globalArgs and are not routed to a method-level
  * `arguments` schema, so a target whose payload is a method argument (like
  * cli-agent's `prompt`) fails validation — by-definition form as "Method
