@@ -198,8 +198,66 @@ export function asciiHeader(value: string): string {
 }
 
 /**
+ * Whether a `runModel` `ok:false` error is a RESOLUTION/AUTHORIZATION failure
+ * (the target model/method couldn't be found or invoked at all) rather than a
+ * genuine execution failure of the invoked model itself. Only resolution
+ * failures are eligible to fall back to the shellout — a genuine execution
+ * failure (e.g. the LLM call itself failed) must surface as-is so we never
+ * double-execute an agent invocation.
+ */
+export function isRunModelResolutionFailure(message: string): boolean {
+  return /not found|cannot invoke model type|Cannot verify dependencies|add .* to dependencies|Maximum cross-model invocation/i
+    .test(message);
+}
+
+/**
+ * Normalize a cli-agent `invocation` resource's attributes (identical shape
+ * whether it arrives inline via the CLI run envelope's `dataArtifacts[0]` or
+ * is fetched by name after a `runModel` call) into `{ success, output, error }`.
+ */
+function normalizeCliAgentArtifact(
+  artifact: Record<string, unknown> | undefined,
+  parse: boolean,
+): {
+  success: boolean;
+  output: Record<string, unknown> | null;
+  error?: string;
+} {
+  if (!artifact) {
+    return {
+      success: false,
+      output: null,
+      error: "No artifact in response",
+    };
+  }
+
+  if (parse && !artifact.parsedResponse) {
+    return {
+      success: false,
+      output: artifact,
+      error: `No parsed JSON in agent output (raw: ${
+        String(artifact.rawOutput ?? "").slice(0, 200)
+      })`,
+    };
+  }
+
+  return {
+    success: artifact.success !== false,
+    output: parse
+      ? (artifact.parsedResponse as Record<string, unknown>)
+      : artifact,
+  };
+}
+
+/**
  * Invoke the CLI-agent model (`invoke` or `invokeAndParse`) and normalize its
- * envelope into `{ success, output, error }`.
+ * envelope into `{ success, output, error }`. Attempts `context.runModel`
+ * first (in-process, no subprocess); falls back to the shelled `swamp model
+ * method run` invocation when runModel is unavailable (older CLI) or fails to
+ * resolve/authorize the call. A genuine execution failure from runModel (the
+ * agent invocation itself failed) is surfaced directly and does NOT fall
+ * back, since cli-agent runs an LLM and re-running it via the shellout would
+ * double-execute the invocation.
  */
 async function invokeCliAgent(
   cliAgentModel: string,
@@ -213,14 +271,13 @@ async function invokeCliAgent(
     wallTimeoutMs: number;
     parse: boolean;
   },
+  context?: MethodContext,
 ): Promise<{
   success: boolean;
   output: Record<string, unknown> | null;
   error?: string;
 }> {
   const method = opts.parse ? "invokeAndParse" : "invoke";
-
-  const inputFile = await Deno.makeTempFile({ suffix: ".json" });
   const inputs: Record<string, unknown> = {
     prompt: opts.prompt,
     provider: opts.provider,
@@ -230,6 +287,71 @@ async function invokeCliAgent(
     wallTimeoutMs: opts.wallTimeoutMs,
   };
 
+  // cli-agent runs in-process under the parent's datastore lock; no mutual
+  // exclusion vs concurrent external writers.
+  if (context && typeof context.runModel === "function") {
+    const runResult = await context.runModel({
+      definition: cliAgentModel,
+      method,
+      arguments: inputs,
+    });
+
+    if (runResult.ok) {
+      // DataHandle is metadata-only (no content) — read the invocation
+      // resource back by name to get its attributes (success/parsedResponse).
+      const handle = runResult.resources[0];
+      if (!handle) {
+        return {
+          success: false,
+          output: null,
+          error: "No artifact in response",
+        };
+      }
+      // runModel ran cli-agent IN-PROCESS in THIS model's repo, so its
+      // artifact was written to the parent repo's datastore — NOT the
+      // `repoDir` arg (which is `subCallRepoDir` pointing at a foreign repo
+      // used only by the cross-repo shellout fallback below). Read it back
+      // from the ambient/parent repo.
+      const readBack = await runSwampCmd(
+        ["data", "get", cliAgentModel, handle.name, "--json"],
+        resolveRepoDir(),
+      );
+      if (!readBack.success) {
+        return {
+          success: false,
+          output: null,
+          error: `Failed to read back ${handle.name}: ${
+            readBack.stderr.slice(0, 300) || `exit code ${readBack.code}`
+          }`,
+        };
+      }
+      try {
+        const parsed = JSON.parse(readBack.stdout);
+        const artifact = parsed.content ?? parsed.attributes;
+        return normalizeCliAgentArtifact(artifact, opts.parse);
+      } catch (e) {
+        return {
+          success: false,
+          output: null,
+          error: `Parse error reading back ${handle.name}: ${
+            (e as Error).message
+          }`,
+        };
+      }
+    }
+
+    // ok:false — only fall back on a resolution/authorization failure.
+    if (!isRunModelResolutionFailure(runResult.error.message)) {
+      return {
+        success: false,
+        output: null,
+        error: runResult.error.message,
+      };
+    }
+    // else: fall through to the shellout below.
+  }
+
+  const inputFile = await Deno.makeTempFile({ suffix: ".json" });
   await Deno.writeTextFile(inputFile, JSON.stringify(inputs, null, 2));
 
   const result = await runSwampCmd(
@@ -279,28 +401,7 @@ async function invokeCliAgent(
     }
 
     const artifact = data.dataArtifacts?.[0]?.attributes;
-    if (!artifact) {
-      return {
-        success: false,
-        output: null,
-        error: "No artifact in response",
-      };
-    }
-
-    if (opts.parse && !artifact.parsedResponse) {
-      return {
-        success: false,
-        output: artifact,
-        error: `No parsed JSON in agent output (raw: ${
-          String(artifact.rawOutput ?? "").slice(0, 200)
-        })`,
-      };
-    }
-
-    return {
-      success: artifact.success !== false,
-      output: opts.parse ? artifact.parsedResponse : artifact,
-    };
+    return normalizeCliAgentArtifact(artifact, opts.parse);
   } catch (e) {
     return {
       success: false,
@@ -622,6 +723,32 @@ type MethodContext = {
     instanceName: string,
     version?: number,
   ) => Promise<Record<string, unknown> | null>;
+  /**
+   * Run a method on another same-repo model in-process (no subprocess, no
+   * datastore lock of its own). Optional — older swamp CLIs won't provide it,
+   * so every call site must null-check before use and fall back to the
+   * shelled `swamp model method run` transport.
+   */
+  runModel?: (options: {
+    definition: string;
+    method: string;
+    arguments?: Record<string, unknown>;
+  }) => Promise<
+    | {
+      ok: true;
+      resources: Array<{
+        name: string;
+        specName: string;
+        kind: string;
+        dataId: string;
+        version: number;
+        size: number;
+        tags: Record<string, string>;
+        metadata: Record<string, unknown>;
+      }>;
+    }
+    | { ok: false; error: { message: string; stack?: string } }
+  >;
   dataRepository: {
     findAllForModel: (
       type: string,
@@ -728,6 +855,7 @@ async function runInvestigation(
       wallTimeoutMs: investigateTimeoutMs,
       parse: true,
     },
+    context,
   );
 
   if (!agentResult.success || !agentResult.output) {
@@ -787,7 +915,7 @@ async function runInvestigation(
  */
 export const model = {
   type: "@mgreten/pr-watcher",
-  version: "2026.07.08.1",
+  version: "2026.07.10.1",
   globalArguments: GlobalArgsSchema,
   resources: {
     investigation: {
