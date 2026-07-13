@@ -696,9 +696,9 @@ export function buildInvestigationPrompt(
   repoDescription: string,
 ): string {
   const feedbackSections = events.map((e) => {
-    let section = `### ${
-      e.authorType === "bot" ? "Bot" : "Human"
-    }: ${wrapUntrusted("PR comment author", sanitizeUntrusted(e.author))} (${e.type})`;
+    let section = `### ${e.authorType === "bot" ? "Bot" : "Human"}: ${
+      wrapUntrusted("PR comment author", sanitizeUntrusted(e.author))
+    } (${e.type})`;
     if (e.filePath) section += `\nFile: ${e.filePath}:${e.line ?? ""}`;
     if (e.diffHunk) {
       section += `\n\`\`\`diff\n${
@@ -709,7 +709,9 @@ export function buildInvestigationPrompt(
     if (e.checkName) {
       section += `\nCheck: ${e.checkName} (${e.checkConclusion})`;
     }
-    section += `\n\n${wrapUntrusted("PR comment body", sanitizeUntrusted(e.body))}`;
+    section += `\n\n${
+      wrapUntrusted("PR comment body", sanitizeUntrusted(e.body))
+    }`;
     return section;
   }).join("\n\n---\n\n");
 
