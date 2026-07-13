@@ -11,7 +11,11 @@ import { assert, assertEquals, assertStringIncludes } from "jsr:@std/assert@1";
 import {
   asciiHeader,
   buildInvestigationPrompt,
+  canonicalApprovalString,
+  computeApprovalHash,
   type FeedbackEvent,
+  headHasMoved,
+  isExpired,
   resolveRepoDir,
 } from "./pr_watcher.ts";
 
@@ -25,7 +29,10 @@ Deno.test("asciiHeader strips emoji so the value is a valid ByteString", () => {
 });
 
 Deno.test("asciiHeader keeps Latin-1 text and collapses newlines", () => {
-  assertEquals(asciiHeader("PR #42 fix FAILED at build"), "PR #42 fix FAILED at build");
+  assertEquals(
+    asciiHeader("PR #42 fix FAILED at build"),
+    "PR #42 fix FAILED at build",
+  );
   assertEquals(asciiHeader("line1\nline2"), "line1 line2");
 });
 
@@ -325,3 +332,135 @@ function wrapUntrustedRange(prompt: string, source: string): string {
   assert(closeIdx !== -1, `expected a closing fence for source "${source}"`);
   return prompt.slice(openIdx, closeIdx);
 }
+
+// --- computeApprovalHash / canonicalApprovalString --------------------------
+//
+// These cover the build-then-approve security property directly: the
+// approvalHash an operator taps "Approve" on must be deterministically bound
+// to the exact diff/commit/base/repo/branch/expiry they were shown, and must
+// change if ANY of those inputs change — otherwise a stale or substituted
+// approval could authorize pushing different content than what was reviewed.
+
+const baseHashInput = {
+  diff: "diff --git a/foo.txt b/foo.txt\n+hello\n",
+  commitSha: "abc123abc123abc123abc123abc123abc123abc1",
+  headSha: "def456def456def456def456def456def456def4",
+  repo: "octocat/hello-world",
+  actionType: "push_fix",
+  headBranch: "feature/widget",
+  expiresAt: "2026-07-14T00:00:00.000Z",
+};
+
+Deno.test("canonicalApprovalString joins fields in order with newlines", () => {
+  const canonical = canonicalApprovalString(baseHashInput);
+  assertEquals(
+    canonical,
+    [
+      baseHashInput.diff,
+      baseHashInput.commitSha,
+      baseHashInput.headSha,
+      baseHashInput.repo,
+      baseHashInput.actionType,
+      baseHashInput.headBranch,
+      baseHashInput.expiresAt,
+    ].join("\n"),
+  );
+});
+
+Deno.test("computeApprovalHash is deterministic for identical inputs", async () => {
+  const h1 = await computeApprovalHash(baseHashInput);
+  const h2 = await computeApprovalHash({ ...baseHashInput });
+  assertEquals(h1, h2);
+  // sha256hex: 64 lowercase hex chars.
+  assert(/^[0-9a-f]{64}$/.test(h1), `expected sha256hex, got "${h1}"`);
+});
+
+Deno.test("computeApprovalHash changes when the diff changes", async () => {
+  const h1 = await computeApprovalHash(baseHashInput);
+  const h2 = await computeApprovalHash({
+    ...baseHashInput,
+    diff: baseHashInput.diff + "\n+one more line\n",
+  });
+  assert(h1 !== h2, "hash must differ when the diff differs");
+});
+
+Deno.test("computeApprovalHash changes when the commit sha changes", async () => {
+  const h1 = await computeApprovalHash(baseHashInput);
+  const h2 = await computeApprovalHash({
+    ...baseHashInput,
+    commitSha: "zzz999zzz999zzz999zzz999zzz999zzz999zzz9",
+  });
+  assert(h1 !== h2, "hash must differ when commitSha differs");
+});
+
+Deno.test("computeApprovalHash changes when the base (headSha) changes", async () => {
+  const h1 = await computeApprovalHash(baseHashInput);
+  const h2 = await computeApprovalHash({
+    ...baseHashInput,
+    headSha: "111111111111111111111111111111111111111a",
+  });
+  assert(h1 !== h2, "hash must differ when the base sha differs");
+});
+
+Deno.test("computeApprovalHash changes when the repo changes", async () => {
+  const h1 = await computeApprovalHash(baseHashInput);
+  const h2 = await computeApprovalHash({
+    ...baseHashInput,
+    repo: "octocat/other-repo",
+  });
+  assert(h1 !== h2, "hash must differ when repo differs");
+});
+
+Deno.test("computeApprovalHash changes when the target branch changes", async () => {
+  const h1 = await computeApprovalHash(baseHashInput);
+  const h2 = await computeApprovalHash({
+    ...baseHashInput,
+    headBranch: "feature/other",
+  });
+  assert(h1 !== h2, "hash must differ when headBranch differs");
+});
+
+Deno.test("computeApprovalHash changes when expiresAt changes", async () => {
+  const h1 = await computeApprovalHash(baseHashInput);
+  const h2 = await computeApprovalHash({
+    ...baseHashInput,
+    expiresAt: "2026-07-15T00:00:00.000Z",
+  });
+  assert(
+    h1 !== h2,
+    "hash must differ when expiresAt differs (extending expiry re-signs)",
+  );
+});
+
+// --- isExpired ----------------------------------------------------------
+
+Deno.test("isExpired is false when now is before expiresAt", () => {
+  const now = new Date("2026-07-13T12:00:00.000Z");
+  assertEquals(isExpired("2026-07-14T00:00:00.000Z", now), false);
+});
+
+Deno.test("isExpired is true when now is after expiresAt", () => {
+  const now = new Date("2026-07-15T00:00:00.000Z");
+  assertEquals(isExpired("2026-07-14T00:00:00.000Z", now), true);
+});
+
+Deno.test("isExpired is false exactly at the expiry boundary (now == expiresAt)", () => {
+  const boundary = "2026-07-14T00:00:00.000Z";
+  assertEquals(isExpired(boundary, new Date(boundary)), false);
+});
+
+// --- headHasMoved ---------------------------------------------------------
+//
+// This is the pure predicate behind pushApprovedFix's "PR head moved since
+// build — rebuild needed" refusal: if the branch's current remote sha no
+// longer matches what the candidate was built against, pushing the
+// candidate's commit would silently discard whatever landed on the branch
+// in the meantime, so pushApprovedFix must refuse.
+
+Deno.test("headHasMoved is false when shas match", () => {
+  assertEquals(headHasMoved("abc123", "abc123"), false);
+});
+
+Deno.test("headHasMoved is true when shas differ (branch advanced or was force-pushed)", () => {
+  assertEquals(headHasMoved("abc123", "def456"), true);
+});

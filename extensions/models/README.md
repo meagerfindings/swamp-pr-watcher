@@ -5,17 +5,25 @@ A configurable, autonomous pull-request feedback engine for
 comments, check failures, bot noise), spawns a CLI coding agent to investigate
 each PR's feedback in the context of its diff, proposes concrete actions
 (reply, push a fix, acknowledge, dismiss, ask for clarification), and sends an
-ntfy notification with an **Approve** button. Operator decisions are recorded,
-and an approved `push_fix` can optionally be applied autonomously inside a
-throwaway, isolated worktree — built, tested, and pushed straight to the PR's
-own head branch.
+ntfy notification with an **Approve** button. Operator decisions are recorded
+via `approve`.
+
+A proposed `push_fix` follows a **build-then-approve** flow: `buildFixCandidate`
+builds and tests the fix inside a throwaway, isolated worktree *before* any
+approval exists, captures the result as a portable artifact (a git bundle plus
+the full diff), and sends a deblinded approval notification showing the actual
+diff with an Approve button hash-bound to it. `approve` requires that hash to
+match (and not be expired). `pushApprovedFix` re-verifies the hash and that the
+PR's head branch hasn't moved since build, then applies the bundle and ships.
 
 The engine is provider- and repo-agnostic. The CLI-agent model, the feed model,
 the GitHub repo, the ntfy server/topics, and the optional worktree + phase
 runner used for autonomous fixes are all configured via global arguments. The
 core loop (investigate → notify → approve → act) works on its own; the
-worktree-isolated `executeWorktreeFix` capability is opt-in and a clean no-op
-unless a worktree model and a phase-runner model are configured.
+worktree-isolated `buildFixCandidate`/`pushApprovedFix` capability is opt-in
+and a clean no-op unless a worktree model and a phase-runner model are
+configured. The older single-shot `executeWorktreeFix` (approve-before-build)
+is retired and fails closed — it approved a summary before the diff existed.
 
 ## Installation
 
@@ -53,15 +61,34 @@ swamp model method run pr-watcher notify \
   --input investigationId=inv-1234-1700000000000 --json
 ```
 
-Record an approval and (optionally) apply the fix in an isolated worktree:
+For a `push_fix` investigation, build+test first — this sends the real,
+diff-bearing approval notification:
+
+```bash
+swamp model method run pr-watcher buildFixCandidate \
+  --input investigationId=inv-1234-1700000000000 --json
+```
+
+Then approve with the `approvalHash` from that notification (or from reading
+the `fixCandidate` resource) and push:
+
+```bash
+swamp model method run pr-watcher approve \
+  --input investigationId=inv-1234-1700000000000 \
+  --input decision=approved \
+  --input approvalHash=<hash from the fixCandidate> --json
+
+swamp model method run pr-watcher pushApprovedFix \
+  --input investigationId=inv-1234-1700000000000 --json
+```
+
+For non-`push_fix` decisions (reply/acknowledge/dismiss/clarify), `approve`
+doesn't require a hash:
 
 ```bash
 swamp model method run pr-watcher approve \
   --input investigationId=inv-1234-1700000000000 \
   --input decision=approved --json
-
-swamp model method run pr-watcher executeWorktreeFix \
-  --input investigationId=inv-1234-1700000000000 --json
 ```
 
 ## Global Arguments
@@ -115,35 +142,70 @@ Creates a Todoist approval task when `todoistProject` is set.
 
 ## Method: approve
 
-Record an operator decision for an investigation.
+Record an operator decision for an investigation. When the investigation has a
+built `fixCandidate` (a `push_fix` that reached `buildFixCandidate`), approving
+it REQUIRES `approvalHash` to match the candidate's current hash exactly, and
+the candidate must not be expired — this is the hash-bound, deblinded approval
+gate. Non-candidate investigations (reply/ack/dismiss/clarify) don't require a
+hash.
 
 | Argument | Type | Required | Purpose |
 |----------|------|----------|---------|
 | `investigationId` | string | yes | Investigation being decided |
 | `decision` | enum | yes | `approved` \| `rejected` \| `modified` \| `deferred` |
+| `approvalHash` | string | conditionally | Required (and must match) when approving a built `push_fix` |
 | `userNote` | string | no | Optional note |
 
 ## Method: act
 
 Execute approved non-write actions (draft GitHub review replies via `gh`).
-`push_fix` is intentionally NOT executed here — use `executeWorktreeFix`.
+`push_fix` is intentionally NOT executed here — use `buildFixCandidate` +
+`pushApprovedFix`.
 
 | Argument | Type | Required | Purpose |
 |----------|------|----------|---------|
 | `investigationId` | string | yes | Investigation whose approved actions to act on |
 
-## Method: executeWorktreeFix
+## Method: buildFixCandidate
 
-Apply an approved `push_fix` autonomously inside a throwaway worktree, test it,
-and push to the PR's own head branch, then tear the worktree down. A no-op
-(not fatal) unless `worktreeModel` + `phaseRunnerModel` are configured AND the
-investigation has an approved action AND a `push_fix`. On a build/test/ship
-failure the worktree is kept (with the partial fix checked out) for manual
-resume; cheap early failures clean up.
+Build and test a proposed `push_fix` inside a throwaway worktree — **no
+push**. NOT gated on an approved action (build happens before approval, by
+design). Captures the built commit as a portable `fixCandidate` artifact: a
+git bundle, the full diff, and a sha256 `approvalHash` binding the diff to its
+commit, base, repo, branch, and a 24h expiry. Tears the worktree down on
+success (the bundle is the portable artifact) or keeps it (for manual resume)
+on a build/test failure. Sends the deblinded approval notification — the one
+that actually authorizes a push — showing the real diff. A no-op (not fatal)
+unless `worktreeModel` + `phaseRunnerModel` are configured AND the
+investigation has a `push_fix`.
 
 | Argument | Type | Required | Purpose |
 |----------|------|----------|---------|
-| `investigationId` | string | yes | Investigation whose `push_fix` to apply |
+| `investigationId` | string | yes | Investigation whose `push_fix` to build |
+
+## Method: pushApprovedFix
+
+Push a hash-approved `fixCandidate` to the PR's head branch. Gated on: an
+approved action whose recorded hash matches the candidate's *current*
+`approvalHash` (re-verified here, not just trusted from `approve` time), the
+candidate not expired, and the PR's remote head branch being unchanged since
+build (refuses — "PR head moved since build, rebuild needed" — if it moved).
+Applies the candidate's bundle in a **fresh** worktree, verifies the landed
+commit sha and a recomputed hash both match exactly, then ships via
+`phaseRunnerModel`. On failure the worktree is kept for manual resume where
+applicable; cheap early failures clean up.
+
+| Argument | Type | Required | Purpose |
+|----------|------|----------|---------|
+| `investigationId` | string | yes | Investigation whose approved fix to push |
+
+## Method: executeWorktreeFix (retired)
+
+Fails closed with an error pointing at `buildFixCandidate` +
+`pushApprovedFix`. Kept only so an un-updated caller fails loudly instead of
+silently pushing an unreviewed diff — the old single-shot flow approved a
+120-char summary before the fix was ever built, so the approval never covered
+the actual diff.
 
 ## How It Works
 
@@ -153,13 +215,17 @@ the feedback grouped by author and diff context, and calls the CLI-agent model's
 an `investigation` resource (14-day lifetime).
 
 `notify` reads an investigation and POSTs to ntfy with an Approve button whose
-`http` action POSTs the investigation id to the `approvalTopic`. A poller of your
-own (launchd, cron, systemd, etc.) drains that topic and calls `approve` then
-`executeWorktreeFix`.
+`http` action POSTs the investigation id to the `approvalTopic` — for a
+`push_fix` investigation this is only a pre-build summary (no diff exists yet
+to hash-bind). A poller of your own (launchd, cron, systemd, etc.) drains that
+topic and calls `approve` then, for `push_fix`, `buildFixCandidate`.
 
-The worktree-fix path is the safety boundary: the autonomous build runs against
-an isolated sibling checkout created by `worktreeModel`, never the foreground
-working tree. The build/test/ship phases are delegated to `phaseRunnerModel`.
+The worktree-fix path is the safety boundary: the autonomous build and push
+each run against a fresh, isolated sibling checkout created by
+`worktreeModel`, never the foreground working tree. The build/test/ship
+phases are delegated to `phaseRunnerModel`. Between build and push, the
+candidate lives as a git bundle on disk — no worktree stays alive across the
+approval wait.
 
 **Prerequisites:** a feed model emitting `event-*` records, an
 `@mgreten/cli-agent`-compatible model, the `gh` CLI authenticated for review

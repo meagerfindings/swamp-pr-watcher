@@ -5,17 +5,32 @@
  * failures, bot noise), spawns a CLI coding agent to investigate each PR's
  * feedback in the context of its diff, proposes concrete actions
  * (reply, push a fix, acknowledge, dismiss, ask for clarification), and pushes
- * an ntfy notification with an Approve button. Operator decisions are recorded,
- * and an approved `push_fix` can be applied autonomously inside a throwaway,
- * isolated worktree — built, tested, and pushed to the PR's own head branch —
- * so the autonomous build never touches the foreground working tree.
+ * an ntfy notification with an Approve button. Operator decisions are recorded
+ * via `approve`.
+ *
+ * A proposed `push_fix` follows a BUILD-THEN-APPROVE flow, not
+ * approve-then-build: `buildFixCandidate` builds and tests the fix inside a
+ * throwaway, isolated worktree BEFORE any approval exists, captures the
+ * result as a portable artifact (a git bundle + the full diff), and sends a
+ * deblinded approval notification that shows the operator the actual diff and
+ * a `investigationId:approvalHash` Approve action — where `approvalHash` is a
+ * sha256 binding the approval to that exact diff, commit, base, repo, branch,
+ * and an expiry. `approve` requires that hash to match (and not be expired)
+ * before recording an approval for a push_fix. `pushApprovedFix` re-verifies
+ * the hash and the PR's head branch (refusing to push if it moved since
+ * build) in a FRESH worktree, applies the bundle, confirms the landed commit
+ * and recomputed hash match exactly, then ships. The autonomous build/push
+ * never touches the foreground working tree — worktrees are the safety
+ * boundary throughout.
  *
  * The engine is provider- and repo-agnostic: the CLI-agent model, the feed
  * model, the GitHub repo, ntfy server/topics, and the optional worktree + phase
  * runner used for autonomous fixes are all configured via global arguments. The
  * core loop (investigate → notify → approve → act) stands alone; the
- * worktree-isolated `executeWorktreeFix` capability is opt-in and a clean no-op
- * unless a worktree model and phase-runner model are configured.
+ * worktree-isolated `buildFixCandidate`/`pushApprovedFix` capability is opt-in
+ * and a clean no-op unless a worktree model and phase-runner model are
+ * configured. `executeWorktreeFix` is retired (fails closed) — see its
+ * description for why approve-before-build was unsafe.
  *
  * @module
  */
@@ -126,6 +141,10 @@ const ActionSchema = z.object({
   userNote: z.string().optional(),
   executedAt: z.string().optional(),
   executionResult: z.string().optional(),
+  /** For a push_fix approval: the fixCandidate.approvalHash the operator
+   * approved, verified against the candidate at approve() time and
+   * re-verified against the (possibly rebuilt) candidate at push time. */
+  approvalHash: z.string().optional(),
 });
 
 /** Audit record of one worktree-isolated autonomous fix attempt. */
@@ -151,6 +170,39 @@ const FixRunSchema = z.object({
   finishedAt: z.string().optional(),
 });
 
+/**
+ * A built-and-tested `push_fix` candidate, captured as a portable artifact
+ * (git bundle + diff text) BEFORE any approval is granted. This is the
+ * deblinding fix: the operator's Approve decision is bound — via
+ * `approvalHash` — to the EXACT diff they were shown, not to "whatever the
+ * agent does next" (the old single-shot executeWorktreeFix approved a
+ * 120-char summary before the build even ran). See `computeApprovalHash`.
+ */
+const FixCandidateSchema = z.object({
+  candidateId: z.string(),
+  investigationId: z.string(),
+  prNumber: z.number(),
+  headBranch: z.string(),
+  /** Commit sha of the built fix (HEAD in the build worktree at capture time). */
+  commitSha: z.string(),
+  /** origin/headBranch sha the fix was built on top of — re-verified at push
+   * time to refuse pushing onto a branch that has since moved. */
+  headSha: z.string(),
+  repo: z.string(),
+  /** Path to the portable `git bundle` artifact carrying commitSha's commits. */
+  bundlePath: z.string(),
+  /** Full `git diff origin/headBranch..HEAD` text — the hash covers this in
+   * full even when the notification only shows a truncated preview. */
+  diff: z.string(),
+  /** sha256hex over the canonical string described in computeApprovalHash. */
+  approvalHash: z.string(),
+  /** ISO timestamp; approve()/pushApprovedFix() reject after this. */
+  expiresAt: z.string(),
+  builtAt: z.string(),
+  buildOk: z.boolean(),
+  testOk: z.boolean(),
+});
+
 /** Result of a shelled subprocess invocation. */
 type CmdResult = {
   stdout: string;
@@ -159,15 +211,25 @@ type CmdResult = {
   success: boolean;
 };
 
-/** Run a `swamp` subcommand scoped to a specific repo directory. */
+/**
+ * Run a `swamp` subcommand scoped to a specific repo directory. `extraEnv`,
+ * when given, is merged over the ambient environment for this subprocess
+ * only — used to thread `GH_TOKEN` into a `swamp model method run` call
+ * (e.g. `ship`) whose own `Deno.Command` invocations (verified: neither
+ * adw_phase_runner's `gt submit` nor cocam_worktree's calls pass an `env`
+ * override of their own) inherit ambient env, so setting it here propagates
+ * all the way down to the `gt`/`git`/`gh` subprocess that actually pushes.
+ */
 async function runSwampCmd(
   args: string[],
   repoDir: string,
+  extraEnv?: Record<string, string>,
 ): Promise<CmdResult> {
   const command = new Deno.Command("swamp", {
     args: [...args, "--repo-dir", repoDir],
     stdout: "piped",
     stderr: "piped",
+    env: extraEnv ? { ...Deno.env.toObject(), ...extraEnv } : undefined,
   });
   const output = await command.output();
   return {
@@ -195,6 +257,83 @@ export function resolveRepoDir(): string {
 export function asciiHeader(value: string): string {
   // deno-lint-ignore no-control-regex
   return value.replace(/[^\x00-\xFF]/g, "").replace(/[\r\n]/g, " ").trim();
+}
+
+/**
+ * Canonical string hashed by `computeApprovalHash` — exported so tests can
+ * assert the exact field order/joiner without duplicating it by hand.
+ */
+export function canonicalApprovalString(input: {
+  diff: string;
+  commitSha: string;
+  headSha: string;
+  repo: string;
+  actionType: string;
+  headBranch: string;
+  expiresAt: string;
+}): string {
+  return [
+    input.diff,
+    input.commitSha,
+    input.headSha,
+    input.repo,
+    input.actionType,
+    input.headBranch,
+    input.expiresAt,
+  ].join("\n");
+}
+
+/**
+ * Hash-bind an approval to the EXACT built fix an operator was shown: the
+ * full diff, the commit it produced, the base it was built on, the repo, the
+ * action type ("push_fix"), the target branch, and the approval's expiry.
+ * Any change to any of these (a different diff, a rebuilt commit, a moved
+ * base, a longer expiry) produces a different hash — so an approvalHash
+ * copy-pasted from one notification can never authorize a different build.
+ *
+ * Uses Web Crypto (`crypto.subtle.digest`), available in Deno without an
+ * extra import — this is runtime model code, not a workflow script, so
+ * pulling in `jsr:@std/crypto` for the same primitive would be redundant.
+ */
+export async function computeApprovalHash(input: {
+  diff: string;
+  commitSha: string;
+  headSha: string;
+  repo: string;
+  actionType: string;
+  headBranch: string;
+  expiresAt: string;
+}): Promise<string> {
+  const canonical = canonicalApprovalString(input);
+  const bytes = new TextEncoder().encode(canonical);
+  const digest = await crypto.subtle.digest("SHA-256", bytes);
+  return Array.from(new Uint8Array(digest))
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
+}
+
+/**
+ * Whether a stored `expiresAt` ISO timestamp has passed `now`. Extracted as
+ * a pure function so `approve`/`pushApprovedFix`'s fail-closed expiry check
+ * is directly testable without a swamp MethodContext.
+ */
+export function isExpired(expiresAt: string, now: Date = new Date()): boolean {
+  return now.getTime() > new Date(expiresAt).getTime();
+}
+
+/**
+ * Whether the PR's head branch has moved since a fix candidate was built.
+ * `pushApprovedFix` re-resolves `origin/headBranch` in a FRESH worktree right
+ * before applying the bundle and calls this to refuse the push if the branch
+ * advanced (new commits, force-push, etc.) after the candidate's `headSha`
+ * was captured — pushing the candidate's commit onto a moved branch would
+ * silently discard whatever landed on the branch in the meantime.
+ */
+export function headHasMoved(
+  candidateHeadSha: string,
+  currentHeadSha: string,
+): boolean {
+  return candidateHeadSha !== currentHeadSha;
 }
 
 /**
@@ -436,6 +575,7 @@ async function runModelMethod(
   method: string,
   inputs: Record<string, unknown>,
   repoDir: string,
+  extraEnv?: Record<string, string>,
 ): Promise<
   { success: boolean; data: Record<string, unknown> | null; error?: string }
 > {
@@ -454,6 +594,7 @@ async function runModelMethod(
       "--json",
     ],
     repoDir,
+    extraEnv,
   );
 
   try {
@@ -499,12 +640,14 @@ async function runModelMethod(
 async function runGitIn(
   cwd: string,
   args: string[],
+  extraEnv?: Record<string, string>,
 ): Promise<{ success: boolean; stdout: string; stderr: string }> {
   const cmd = new Deno.Command("git", {
     args,
     cwd,
     stdout: "piped",
     stderr: "piped",
+    env: extraEnv ? { ...Deno.env.toObject(), ...extraEnv } : undefined,
   });
   const out = await cmd.output();
   return {
@@ -534,6 +677,93 @@ async function runGh(args: string[]): Promise<GhResult> {
     stderr: new TextDecoder().decode(output.stderr),
     success: output.success,
   };
+}
+
+/**
+ * Reader/actor token routing (pending org PATs).
+ *
+ * The org is provisioning two scoped GitHub PATs — `github-reader-pat`
+ * (read-only: investigate/build) and `github-actor-pat` (write: push) — into
+ * a vault named "watcher-github", surfaced via a sibling swamp model
+ * `secret-access` (in agentic-tooling) that is STILL BEING BUILT. This
+ * helper isolates token acquisition behind one seam so the rest of this file
+ * never talks to the vault directly, and so `secret-access`'s eventual
+ * return-shape only needs a fix in one place.
+ *
+ * TODO(pending PATs): today this DEGRADES to null (→ caller falls back to
+ * ambient `gh`/`git` auth) on ANY failure — missing model, wrong repo dir,
+ * malformed output, anything. That is intentional while the PATs and
+ * `secret-access` are unapproved/unbuilt: we must not fail closed on a
+ * missing token yet, or every build/push would break today. Once the PATs
+ * are live, flip the call sites (buildFixCandidate's reader use,
+ * pushApprovedFix's actor use) to treat a null return as fatal instead of a
+ * silent fallback — that is the fail-closed switch-over.
+ */
+async function resolveGithubToken(
+  role: "reader" | "actor",
+  context: MethodContext,
+  phase: string,
+): Promise<string | null> {
+  const repoDir = context.globalArgs.subCallRepoDir ||
+    `${Deno.env.get("HOME")}/git/agentic-tooling`;
+
+  const result = await runSwampCmd(
+    [
+      "model",
+      "method",
+      "run",
+      "secret-access",
+      "read",
+      "--input",
+      `key=github-${role}-pat`,
+      "--input",
+      `purpose=pr-watcher-${phase}`,
+      "--json",
+    ],
+    repoDir,
+  );
+
+  if (!result.success) {
+    context.logger.warning(
+      "resolveGithubToken({role}) unavailable, falling back to ambient gh auth: {detail}",
+      {
+        role,
+        detail: (result.stderr || result.stdout).slice(0, 200) ||
+          `exit ${result.code}`,
+      },
+    );
+    return null;
+  }
+
+  try {
+    const data = JSON.parse(result.stdout);
+    // TODO(secret-access contract): the model isn't finished yet, so this is
+    // a best guess at its --json shape — most likely dataArtifacts[0]
+    // .attributes carrying either the raw token value or a path to a file
+    // containing it. Revisit once secret-access lands and exposes its real
+    // schema; until then any shape mismatch below falls through to the
+    // catch and degrades to null (ambient gh), same as a hard failure.
+    const attrs = data.dataArtifacts?.[0]?.attributes as
+      | Record<string, unknown>
+      | undefined;
+    const token = (attrs?.value ?? attrs?.token ?? attrs?.secret) as
+      | string
+      | undefined;
+    if (typeof token === "string" && token.length > 0) {
+      return token;
+    }
+    context.logger.warning(
+      "resolveGithubToken({role}) got a response with no recognizable token field, falling back to ambient gh auth",
+      { role },
+    );
+    return null;
+  } catch (e) {
+    context.logger.warning(
+      "resolveGithubToken({role}) failed to parse secret-access response, falling back to ambient gh auth: {err}",
+      { role, err: e instanceof Error ? e.message : String(e) },
+    );
+    return null;
+  }
 }
 
 /**
@@ -567,6 +797,40 @@ async function findApprovedAction(
     } catch { /* skip */ }
   }
   return null;
+}
+
+/**
+ * Locate the most recent `fixCandidate` resource for an investigation.
+ * Shared by `approve` (hash/expiry check at approval time) and
+ * `pushApprovedFix` (re-verification at push time). Returns null when no
+ * candidate has been built (e.g. a non-push_fix investigation).
+ */
+async function findFixCandidateForInvestigation(
+  investigationId: string,
+  context: MethodContext,
+): Promise<z.infer<typeof FixCandidateSchema> | null> {
+  const all = await context.dataRepository.findAllForModel(
+    context.modelType,
+    context.modelId,
+  );
+  let latest: z.infer<typeof FixCandidateSchema> | null = null;
+  for (const data of all) {
+    if (data.tags?.specName !== "fixCandidate") continue;
+    const content = await context.dataRepository.getContent(
+      context.modelType,
+      context.modelId,
+      data.name,
+    );
+    if (!content) continue;
+    try {
+      const candidate = JSON.parse(new TextDecoder().decode(content));
+      if (candidate.investigationId !== investigationId) continue;
+      // candidateId embeds Date.now(); later timestamp wins if there are
+      // multiple builds (e.g. a rebuild after expiry).
+      if (!latest || candidate.builtAt > latest.builtAt) latest = candidate;
+    } catch { /* skip */ }
+  }
+  return latest;
 }
 
 /** A single feedback event surfaced by the feed model. */
@@ -976,13 +1240,94 @@ async function runInvestigation(
   return investigation;
 }
 
+/** Max diff chars inlined in the deblinded approval notification body. The
+ * hash is always computed over the FULL diff (see computeApprovalHash) —
+ * this cap only affects what the operator sees before tapping Approve. */
+const NOTIFY_DIFF_PREVIEW_CHARS = 3000;
+
+/**
+ * Send the deblinded, hash-bound approval notification for a built fix
+ * candidate — the notification that actually authorizes a push. Unlike
+ * `notify` (pre-build summary), the operator here sees the real diff and the
+ * Approve button POSTs `investigationId:approvalHash`, so the decision is
+ * bound to the exact bytes that will be pushed.
+ */
+async function sendFixCandidateApprovalNotification(
+  investigation: z.infer<typeof InvestigationSchema>,
+  candidate: z.infer<typeof FixCandidateSchema>,
+  context: MethodContext,
+): Promise<void> {
+  const { ntfyTopic, approvalTopic, ntfyBaseUrl, ntfyExtraTag } =
+    context.globalArgs;
+
+  const truncated = candidate.diff.length > NOTIFY_DIFF_PREVIEW_CHARS;
+  const diffPreview = truncated
+    ? candidate.diff.slice(0, NOTIFY_DIFF_PREVIEW_CHARS) +
+      `\n... [truncated, ${
+        candidate.diff.length - NOTIFY_DIFF_PREVIEW_CHARS
+      } more chars — approval hash covers the FULL diff]`
+    : candidate.diff;
+
+  const title = `PR #${investigation.prNumber}: fix built, ready to push`;
+  const message = [
+    investigation.prTitle,
+    "",
+    `Built on ${candidate.headBranch} @ ${candidate.headSha.slice(0, 12)}`,
+    `Commit: ${candidate.commitSha.slice(0, 12)}`,
+    `Expires: ${candidate.expiresAt}`,
+    "",
+    "Diff:",
+    "```diff",
+    diffPreview,
+    "```",
+    "",
+    "Tap Approve to push EXACTLY this diff to the PR's branch.",
+  ].join("\n");
+
+  const ntfyUrl = `${ntfyBaseUrl}/${ntfyTopic}`;
+
+  // Approve POSTs "investigationId:approvalHash" — approve() requires the
+  // hash to match this exact candidate and rejects on any mismatch or
+  // expiry (fail-closed). This is the deblinded, hash-bound Approve; the
+  // bare-id Approve in `notify` is NOT sufficient to authorize a push.
+  const approveAction =
+    `http, Approve, ${ntfyBaseUrl}/${approvalTopic}, method=POST, ` +
+    `body=${investigation.investigationId}:${candidate.approvalHash}, clear=true`;
+  const viewAction = `view, View PR, ${investigation.prUrl}, clear=true`;
+  const actions = [approveAction, viewAction].join("; ");
+
+  context.logger.info(
+    "Sending deblinded fix-candidate approval notification to {url}",
+    { url: ntfyUrl },
+  );
+
+  const response = await fetch(ntfyUrl, {
+    method: "POST",
+    headers: {
+      "Title": asciiHeader(title),
+      "Priority": "4",
+      "Tags": asciiHeader(ntfyExtraTag ? `wrench,${ntfyExtraTag}` : "wrench"),
+      "Actions": asciiHeader(actions),
+      "Click": investigation.prUrl,
+    },
+    body: message,
+  });
+
+  if (!response.ok) {
+    const respBody = await response.text();
+    throw new Error(
+      `ntfy HTTP ${response.status}: ${respBody.slice(0, 200)}`,
+    );
+  }
+}
+
 /**
  * The pr-watcher model: a configurable PR-feedback investigation and
  * autonomous-fix engine. See the module doc for the full lifecycle.
  */
 export const model = {
   type: "@mgreten/pr-watcher",
-  version: "2026.07.10.2",
+  version: "2026.07.13.1",
   globalArguments: GlobalArgsSchema,
   resources: {
     investigation: {
@@ -1005,6 +1350,15 @@ export const model = {
         "which phases ran, their outcomes, and whether the PR branch was updated.",
       schema: FixRunSchema,
       lifetime: "14d" as const,
+      garbageCollection: 50,
+    },
+    fixCandidate: {
+      description:
+        "A built-and-tested push_fix, captured as a portable git-bundle " +
+        "artifact and hash-bound to its diff BEFORE approval. Approve() and " +
+        "pushApprovedFix() both verify against this record's approvalHash.",
+      schema: FixCandidateSchema,
+      lifetime: "1d" as const,
       garbageCollection: 50,
     },
   },
@@ -1102,7 +1456,13 @@ export const model = {
       description:
         "Send an ntfy notification summarizing an investigation with proposed " +
         "actions and an Approve action button. Optionally creates a Todoist " +
-        "approval task when a Todoist project is configured.",
+        "approval task when a Todoist project is configured. IMPORTANT: for " +
+        "a push_fix investigation this is the PRE-BUILD summary only — it " +
+        "does NOT carry an approve-capable Approve button (no diff exists " +
+        "yet to hash-bind). The real, diff-bearing approval notification for " +
+        "push_fix is sent by buildFixCandidate AFTER build+test. This method's " +
+        "Approve button here only records a bare decision, useful for the " +
+        "non-push_fix reply/ack/dismiss/clarify flows.",
       arguments: z.object({
         investigationId: z.string().describe(
           "ID of the investigation to notify about",
@@ -1147,7 +1507,7 @@ export const model = {
           actionSummary,
           "",
           hasPushFix
-            ? "Tap Approve to build+test+push the fix to this PR's branch in a worktree."
+            ? "push_fix proposed — building + testing before an approval request is sent (no diff to approve yet)."
             : "No push_fix — Approve just records the decision.",
         ].join("\n");
 
@@ -1159,8 +1519,14 @@ export const model = {
 
         // ntfy `http` action button: tapping Approve POSTs the investigationId
         // to the approvals topic. A poller drains that topic and runs approve +
-        // executeWorktreeFix where the worktree/build toolchain lives. ntfy
-        // caps actions at 3.
+        // (non-push_fix only) act. ntfy caps actions at 3.
+        //
+        // For push_fix this bare-id Approve button is intentionally NOT the
+        // approval that authorizes a push — approve() requires an
+        // approvalHash for any investigation that has a fixCandidate, so a
+        // tap here on a push_fix investigation records a decision but
+        // pushApprovedFix still can't run without the real hash-bearing
+        // Approve from buildFixCandidate's post-build notification.
         //
         // The action LABEL must stay ASCII: it travels in the `Actions` HTTP
         // header, and fetch() rejects any header value with a code point > 255
@@ -1272,16 +1638,26 @@ export const model = {
     approve: {
       description:
         "Record a user decision (approve, reject, modify, defer) for an " +
-        "investigation.",
+        "investigation. When the investigation has a built fixCandidate " +
+        "(a push_fix that reached buildFixCandidate), an `approved` decision " +
+        "REQUIRES `approvalHash` to match the candidate's approvalHash " +
+        "exactly and the candidate must not be expired — this is the " +
+        "hash-bound, deblinded approval gate. Non-candidate investigations " +
+        "(reply/ack/dismiss/clarify) don't require a hash.",
       arguments: z.object({
         investigationId: z.string(),
         decision: z.enum(["approved", "rejected", "modified", "deferred"]),
+        approvalHash: z.string().optional().describe(
+          "Required, and must match the investigation's fixCandidate, when " +
+            "approving a push_fix investigation that has been built.",
+        ),
         userNote: z.string().optional(),
       }),
       execute: async (
         args: {
           investigationId: string;
           decision: "approved" | "rejected" | "modified" | "deferred";
+          approvalHash?: string;
           userNote?: string;
         },
         context: MethodContext,
@@ -1296,6 +1672,50 @@ export const model = {
           );
         }
 
+        let approvalHash: string | undefined;
+
+        if (args.decision === "approved") {
+          const candidate = await findFixCandidateForInvestigation(
+            args.investigationId,
+            context,
+          );
+
+          if (candidate) {
+            // A fixCandidate exists — this is (or was) a push_fix. The
+            // decision MUST be bound to the exact built diff via its hash;
+            // a bare-id approval (from the pre-build `notify`) is not
+            // sufficient to authorize a push. Fail closed on any mismatch.
+            if (!args.approvalHash) {
+              throw new Error(
+                `Investigation ${args.investigationId} has a built fix ` +
+                  `candidate — approving it requires approvalHash from the ` +
+                  `deblinded notification (POST body ` +
+                  `"investigationId:approvalHash"), not a bare investigationId.`,
+              );
+            }
+            if (args.approvalHash !== candidate.approvalHash) {
+              throw new Error(
+                `approvalHash mismatch for investigation ${args.investigationId} ` +
+                  `— the approval does not match the current fix candidate ` +
+                  `(candidate ${candidate.candidateId}). Refusing to record ` +
+                  `approval; rebuild via buildFixCandidate and approve the ` +
+                  `new hash.`,
+              );
+            }
+            if (isExpired(candidate.expiresAt)) {
+              throw new Error(
+                `Fix candidate ${candidate.candidateId} for investigation ` +
+                  `${args.investigationId} expired at ${candidate.expiresAt} ` +
+                  `— approval expired, rebuild needed (call buildFixCandidate ` +
+                  `again).`,
+              );
+            }
+            approvalHash = args.approvalHash;
+          }
+          // else: no candidate (non-push_fix path) — approvalHash not
+          // required, matching the pre-existing backward-compatible flow.
+        }
+
         const actionId = `action-${Date.now()}`;
         const action = {
           actionId,
@@ -1304,6 +1724,7 @@ export const model = {
           eventIds: investigation.eventIds,
           decision: args.decision,
           userNote: args.userNote,
+          approvalHash,
         };
 
         context.logger.info(
@@ -1449,13 +1870,52 @@ export const model = {
 
     executeWorktreeFix: {
       description:
-        "Autonomously apply an approved push_fix inside a throwaway worktree, " +
-        "test it, and push it to the PR's OWN head branch (updating the " +
-        "existing PR in place), then tear the worktree down. The worktree is " +
-        "the safety boundary: the autonomous build runs against an isolated " +
-        "sibling checkout, never the foreground tree. No-op (not fatal) unless " +
-        "worktreeModel + phaseRunnerModel are configured AND the investigation " +
-        "has an approved action AND a push_fix proposed action.",
+        "DEPRECATED — fails closed. This single-shot build-then-push method " +
+        "let an operator approve a 120-char summary BEFORE the fix was built, " +
+        "so the approval never covered the actual diff. It has been split " +
+        "into buildFixCandidate (build+test, no push) and pushApprovedFix " +
+        "(push, gated on a hash-bound approval of the built diff) — see the " +
+        "module doc. This shim exists only so an un-updated caller (e.g. a " +
+        "bridge that still shells `executeWorktreeFix`) fails loudly instead " +
+        "of silently pushing an unreviewed diff.",
+      arguments: z.object({
+        investigationId: z.string(),
+      }),
+      execute: (
+        args: { investigationId: string },
+        context: MethodContext,
+      ): never => {
+        context.logger.error(
+          "executeWorktreeFix called for investigation {id} — refusing: " +
+            "this method is retired for security reasons (approval happened " +
+            "before the diff existed). Use buildFixCandidate then " +
+            "pushApprovedFix instead.",
+          { id: args.investigationId },
+        );
+        throw new Error(
+          "executeWorktreeFix is retired: approval-before-build is no " +
+            "longer supported. Call buildFixCandidate(investigationId) to " +
+            "build+test and get a hash-bound approval notification, then " +
+            "approve(investigationId, 'approved', approvalHash) and " +
+            "pushApprovedFix(investigationId) to push. See the module doc " +
+            "for the full build-then-approve flow.",
+        );
+      },
+    },
+
+    buildFixCandidate: {
+      description:
+        "Build and test an approved-to-BUILD push_fix inside a throwaway " +
+        "worktree — NO push. Captures the result as a portable fixCandidate " +
+        "(git bundle + full diff + a sha256 approvalHash binding the diff to " +
+        "its commit, base, repo, branch, and an expiry) and sends the real, " +
+        "deblinded approval notification carrying the diff. This is deliberately " +
+        "NOT gated on an approved action — the whole point is to build BEFORE " +
+        "asking for approval, so the operator reviews the actual diff instead " +
+        "of a summary. The push itself happens only via pushApprovedFix, once " +
+        "approve() has recorded a matching, unexpired approvalHash. No-op " +
+        "(not fatal) unless worktreeModel + phaseRunnerModel are configured " +
+        "AND the investigation has a push_fix proposed action.",
       arguments: z.object({
         investigationId: z.string(),
       }),
@@ -1468,6 +1928,7 @@ export const model = {
           repoPath,
           worktreeModel,
           phaseRunnerModel,
+          githubRepo,
           suppressFixNotifications,
           subCallRepoDir,
         } = context.globalArgs;
@@ -1479,7 +1940,7 @@ export const model = {
         // Capability gate: autonomous fixes require both helper models.
         if (!worktreeModel || !phaseRunnerModel) {
           context.logger.info(
-            "executeWorktreeFix is not configured (worktreeModel/phaseRunnerModel unset); skipping",
+            "buildFixCandidate is not configured (worktreeModel/phaseRunnerModel unset); skipping",
           );
           return { dataHandles: [] };
         }
@@ -1491,33 +1952,23 @@ export const model = {
           throw new Error(`Investigation ${args.investigationId} not found`);
         }
 
-        // Gate 1: must be operator-approved.
-        const approved = await findApprovedAction(
-          args.investigationId,
-          context,
-        );
-        if (!approved) {
-          throw new Error(
-            `No approved action for investigation ${args.investigationId} — ` +
-              `refusing autonomous worktree fix`,
-          );
-        }
-
-        // Gate 2: must actually propose a push_fix. dismiss/acknowledge/
-        // reply_comment are handled (safely) by `act`, never here.
+        // Gate: must actually propose a push_fix. dismiss/acknowledge/
+        // reply_comment are handled (safely) by `act`, never here. Unlike
+        // the old executeWorktreeFix, there is NO approved-action gate here
+        // — build runs BEFORE approval by design.
         const pushFixes = investigation.proposedActions.filter(
           (a: z.infer<typeof ProposedActionSchema>) => a.type === "push_fix",
         );
         if (pushFixes.length === 0) {
           context.logger.info(
-            "No push_fix proposed for PR #{prNumber}; nothing for executeWorktreeFix to do",
+            "No push_fix proposed for PR #{prNumber}; nothing for buildFixCandidate to do",
             { prNumber: investigation.prNumber },
           );
           return { dataHandles: [] };
         }
 
         // Recover the PR head branch — it lives on the feed events, not the
-        // investigation. We push the fix onto THIS branch (updating the exact
+        // investigation. We build the fix onto THIS branch (updating the exact
         // PR the notification was for), never a new or upstack branch.
         const events = await loadFeedbackEvents(
           context,
@@ -1532,29 +1983,35 @@ export const model = {
           );
         }
 
+        // Reader-scope token for the (read-only) build+test phase. Degrades
+        // to null (ambient gh auth) until the org PATs land — see
+        // resolveGithubToken's TODO.
+        const readerToken = await resolveGithubToken(
+          "reader",
+          context,
+          "build",
+        );
+        const readerEnv = readerToken ? { GH_TOKEN: readerToken } : undefined;
+        if (!readerToken) {
+          context.logger.warning(
+            "buildFixCandidate PR #{prNumber}: no reader PAT available, using ambient gh auth (fallback, not fail-closed — TODO once PATs land)",
+            { prNumber: investigation.prNumber },
+          );
+        }
+
         const worktreeId = `pr-${investigation.prNumber}-fix`;
         // The worktree model creates worktrees as siblings of the repo:
         // {dirname(repoPath)}/{identifier}.
         const repoParent = repoPath.split("/").slice(0, -1).join("/");
         const worktreePath = `${repoParent}/${worktreeId}`;
 
-        const fixRunId = `fix-${investigation.prNumber}-${Date.now()}`;
-        const fixRun: z.infer<typeof FixRunSchema> = {
-          fixRunId,
-          investigationId: args.investigationId,
-          prNumber: investigation.prNumber,
-          headBranch,
-          worktreeId,
-          worktreePath,
+        const candidateId = `cand-${investigation.prNumber}-${Date.now()}`;
+        const fixRun = {
           worktreeCreated: false,
-          checkoutOk: null,
-          buildOk: null,
-          testOk: null,
-          shipOk: null,
-          worktreeRemoved: false,
-          success: false,
+          checkoutOk: null as boolean | null,
+          buildOk: null as boolean | null,
+          testOk: null as boolean | null,
           summary: "",
-          startedAt: new Date().toISOString(),
         };
 
         // The fix instruction handed to the build phase. Multiple push_fixes
@@ -1570,50 +2027,35 @@ export const model = {
           ),
         ].join("\n");
 
-        // Record the fixRun and (only on success) tear the worktree down. On
-        // FAILURE the worktree is KEPT — with the partial fix and the PR's
-        // branch already checked out — so the operator can cd in and finish by
-        // hand. The fixRun artifact records its path.
-        const finalize = async (
-          keepWorktree: boolean,
-        ): Promise<{ dataHandles: [Record<string, unknown>] }> => {
-          if (fixRun.worktreeCreated && !keepWorktree) {
-            const rm = await runModelMethod(
-              worktreeModel,
-              "remove",
-              { identifier: worktreeId },
-              toolRepoDir,
-            );
-            fixRun.worktreeRemoved = rm.success;
-            if (!rm.success) {
-              context.logger.warning(
-                "Worktree {id} teardown failed (manual cleanup needed): {err}",
-                { id: worktreeId, err: rm.error ?? "unknown" },
-              );
-            }
-          }
-          fixRun.finishedAt = new Date().toISOString();
-          const handle = await context.writeResource(
-            "fixRun",
-            fixRunId,
-            fixRun as unknown as Record<string, unknown>,
+        // On failure the worktree is KEPT — with the partial fix and the
+        // PR's branch already checked out — so the operator can cd in and
+        // finish by hand. On SUCCESS the worktree is torn down here (unlike
+        // the old executeWorktreeFix): the git bundle is now the portable
+        // artifact, so there is no reason to keep a worktree alive across
+        // the approval wait.
+        const teardownWorktree = async (): Promise<boolean> => {
+          if (!fixRun.worktreeCreated) return true;
+          const rm = await runModelMethod(
+            worktreeModel,
+            "remove",
+            { identifier: worktreeId },
+            toolRepoDir,
           );
-          return { dataHandles: [handle] };
+          if (!rm.success) {
+            context.logger.warning(
+              "Worktree {id} teardown failed (manual cleanup needed): {err}",
+              { id: worktreeId, err: rm.error ?? "unknown" },
+            );
+          }
+          return rm.success;
         };
 
-        // Push a failure alert back to the ntfy topic so it reaches the phone
-        // and is waiting when the laptop terminal is reopened. Best effort — a
-        // notify failure must not mask the underlying fix failure.
-        const notifyFixFailure = async (
+        const notifyBuildFailure = async (
           phase: string,
           resumable: boolean,
         ): Promise<void> => {
           const { ntfyTopic, ntfyBaseUrl, ntfyExtraTag } = context.globalArgs;
-          const lines = [
-            investigation.prTitle,
-            "",
-            fixRun.summary,
-          ];
+          const lines = [investigation.prTitle, "", fixRun.summary];
           if (resumable) {
             lines.push(
               "",
@@ -1628,10 +2070,8 @@ export const model = {
             await fetch(`${ntfyBaseUrl}/${ntfyTopic}`, {
               method: "POST",
               headers: {
-                // Title stays ASCII (HTTP header = ByteString). The `x` tag
-                // below renders the ❌ emoji in the ntfy client.
                 "Title": asciiHeader(
-                  `PR #${investigation.prNumber} fix FAILED at ${phase}`,
+                  `PR #${investigation.prNumber} fix build FAILED at ${phase}`,
                 ),
                 "Priority": "4",
                 "Tags": ntfyExtraTag ? `x,${ntfyExtraTag}` : "x",
@@ -1650,56 +2090,25 @@ export const model = {
         const fail = async (
           phase: string,
           detail: string,
-        ): Promise<{ dataHandles: [Record<string, unknown>] }> => {
+        ): Promise<{ dataHandles: [] }> => {
           fixRun.summary = `${phase} failed: ${detail}`.slice(0, 500);
           context.logger.error(
-            "executeWorktreeFix PR #{prNumber} {phase}: {detail}",
+            "buildFixCandidate PR #{prNumber} {phase}: {detail}",
             { prNumber: investigation.prNumber, phase, detail },
           );
-          // Keep the worktree only once it holds resumable work (build/test/
-          // ship). The cheap early failures (worktree-add, fetch, checkout)
+          // Keep the worktree only once it holds resumable work (build/
+          // test). The cheap early failures (worktree-add, fetch, checkout)
           // have nothing to salvage, so those still clean up.
-          const resumable = ["build", "test", "ship"].includes(phase);
+          const resumable = ["build", "test"].includes(phase);
+          if (!resumable) await teardownWorktree();
           if (!suppressFixNotifications) {
-            await notifyFixFailure(phase, resumable);
+            await notifyBuildFailure(phase, resumable);
           }
-          return await finalize(resumable);
-        };
-
-        // Push a success alert to the same ntfy topic so a tap from the phone
-        // always reports its outcome (symmetry with notifyFixFailure) —
-        // silence would be ambiguous.
-        const notifyFixSuccess = async (): Promise<void> => {
-          const { ntfyTopic, ntfyBaseUrl, ntfyExtraTag } = context.globalArgs;
-          try {
-            await fetch(`${ntfyBaseUrl}/${ntfyTopic}`, {
-              method: "POST",
-              headers: {
-                // Title stays ASCII (HTTP header = ByteString). The
-                // white_check_mark tag renders the ✅ emoji in the ntfy client.
-                "Title": `PR #${investigation.prNumber} fix pushed`,
-                "Priority": "3",
-                "Tags": ntfyExtraTag
-                  ? `white_check_mark,${ntfyExtraTag}`
-                  : "white_check_mark",
-                "Click": investigation.prUrl,
-              },
-              body: [
-                investigation.prTitle,
-                "",
-                `Built, tested, and pushed to ${headBranch}.`,
-              ].join("\n"),
-            });
-          } catch (err) {
-            context.logger.warning(
-              "Success notification could not be sent: {err}",
-              { err: err instanceof Error ? err.message : String(err) },
-            );
-          }
+          return { dataHandles: [] };
         };
 
         context.logger.info(
-          "executeWorktreeFix PR #{prNumber}: {n} push_fix on branch {branch}",
+          "buildFixCandidate PR #{prNumber}: {n} push_fix on branch {branch}",
           {
             prNumber: investigation.prNumber,
             n: pushFixes.length,
@@ -1736,7 +2145,7 @@ export const model = {
           "fetch",
           "origin",
           headBranch,
-        ]);
+        ], readerEnv);
         if (!fetchResult.success) {
           fixRun.checkoutOk = false;
           return await fail("git-fetch", fetchResult.stderr.slice(0, 300));
@@ -1758,6 +2167,20 @@ export const model = {
         ]);
         fixRun.checkoutOk = true;
 
+        // Capture the base sha BEFORE build commits, for both the bundle
+        // range and the candidate's headSha (re-verified at push time).
+        const headShaResult = await runGitIn(worktreePath, [
+          "rev-parse",
+          `origin/${headBranch}`,
+        ]);
+        if (!headShaResult.success) {
+          return await fail(
+            "git-rev-parse-head",
+            headShaResult.stderr.slice(0, 300),
+          );
+        }
+        const headSha = headShaResult.stdout.trim();
+
         // 3) Build the fix (build phase owns the commit), fenced to the worktree.
         const build = await runModelMethod(
           phaseRunnerModel,
@@ -1770,7 +2193,7 @@ export const model = {
           return await fail("build", build.error ?? "unknown");
         }
 
-        // 4) Test in the worktree. A test failure blocks the push.
+        // 4) Test in the worktree. A test failure blocks capturing a candidate.
         const test = await runModelMethod(
           phaseRunnerModel,
           "test",
@@ -1782,33 +2205,555 @@ export const model = {
           return await fail("test", test.error ?? "tests failed");
         }
 
-        // 5) Ship: submit from the worktree updates the PR branch in place.
+        // 5) Capture the built commit as a portable artifact: bundle + diff
+        // + shas. This is what makes the fix reviewable and re-appliable
+        // without keeping the worktree alive.
+        const commitShaResult = await runGitIn(worktreePath, [
+          "rev-parse",
+          "HEAD",
+        ]);
+        if (!commitShaResult.success) {
+          return await fail(
+            "git-rev-parse-commit",
+            commitShaResult.stderr.slice(0, 300),
+          );
+        }
+        const commitSha = commitShaResult.stdout.trim();
+
+        const diffResult = await runGitIn(worktreePath, [
+          "diff",
+          `origin/${headBranch}..HEAD`,
+        ]);
+        if (!diffResult.success) {
+          return await fail("git-diff", diffResult.stderr.slice(0, 300));
+        }
+        const diff = diffResult.stdout;
+
+        if (diff.trim().length === 0) {
+          // Build phase reported success but produced no commit ahead of
+          // origin/headBranch — nothing to approve or push.
+          return await fail(
+            "build",
+            "build phase succeeded but produced no diff vs origin/" +
+              headBranch,
+          );
+        }
+
+        const bundleDir = `${Deno.env.get("HOME")}/.adw/pr-fix-bundles`;
+        try {
+          await Deno.mkdir(bundleDir, { recursive: true });
+        } catch (e) {
+          return await fail(
+            "bundle-mkdir",
+            e instanceof Error ? e.message : String(e),
+          );
+        }
+        const bundlePath = `${bundleDir}/${args.investigationId}.bundle`;
+        const bundleResult = await runGitIn(worktreePath, [
+          "bundle",
+          "create",
+          bundlePath,
+          `origin/${headBranch}..HEAD`,
+        ]);
+        if (!bundleResult.success) {
+          return await fail(
+            "git-bundle",
+            bundleResult.stderr.slice(0, 300),
+          );
+        }
+
+        const expiresAt = new Date(Date.now() + 24 * 60 * 60 * 1000)
+          .toISOString();
+        const approvalHash = await computeApprovalHash({
+          diff,
+          commitSha,
+          headSha,
+          repo: githubRepo,
+          actionType: "push_fix",
+          headBranch,
+          expiresAt,
+        });
+
+        const candidate: z.infer<typeof FixCandidateSchema> = {
+          candidateId,
+          investigationId: args.investigationId,
+          prNumber: investigation.prNumber,
+          headBranch,
+          commitSha,
+          headSha,
+          repo: githubRepo,
+          bundlePath,
+          diff,
+          approvalHash,
+          expiresAt,
+          builtAt: new Date().toISOString(),
+          buildOk: true,
+          testOk: true,
+        };
+
+        const handle = await context.writeResource(
+          "fixCandidate",
+          candidateId,
+          candidate as unknown as Record<string, unknown>,
+        );
+
+        context.logger.info(
+          "buildFixCandidate PR #{prNumber} SUCCEEDED — candidate {id} @ {sha}, awaiting approval",
+          {
+            prNumber: investigation.prNumber,
+            id: candidateId,
+            sha: commitSha.slice(0, 12),
+          },
+        );
+
+        // Tear down now — the bundle is the portable artifact; no worktree
+        // needs to stay alive while waiting for the operator to approve.
+        await teardownWorktree();
+
+        // Send the deblinded, hash-bound approval notification — this is
+        // the notification that actually authorizes a push, unlike the
+        // pre-build `notify`.
+        if (!suppressFixNotifications) {
+          try {
+            await sendFixCandidateApprovalNotification(
+              investigation,
+              candidate,
+              context,
+            );
+          } catch (err) {
+            context.logger.warning(
+              "Deblinded approval notification could not be sent: {err}",
+              { err: err instanceof Error ? err.message : String(err) },
+            );
+          }
+        }
+
+        return { dataHandles: [handle] };
+      },
+    },
+
+    pushApprovedFix: {
+      description:
+        "Push a hash-approved fixCandidate to the PR's head branch. Gated " +
+        "on: an approved action whose recorded approvalHash matches the " +
+        "candidate's CURRENT approvalHash (re-verified here, not just trusted " +
+        "from approve()), the candidate not being expired, and the PR's " +
+        "remote head branch being UNCHANGED since the candidate was built " +
+        "(refuses to push onto a moved branch). Applies the candidate's git " +
+        "bundle in a FRESH worktree, verifies the landed commit sha matches " +
+        "exactly, then ships via phaseRunnerModel.",
+      arguments: z.object({
+        investigationId: z.string(),
+      }),
+      execute: async (
+        args: { investigationId: string },
+        context: MethodContext,
+      ) => {
+        const {
+          repoPath,
+          worktreeModel,
+          phaseRunnerModel,
+          suppressFixNotifications,
+          subCallRepoDir,
+        } = context.globalArgs;
+        const repoDir = resolveRepoDir();
+        const toolRepoDir = subCallRepoDir || repoDir;
+
+        if (!worktreeModel || !phaseRunnerModel) {
+          context.logger.info(
+            "pushApprovedFix is not configured (worktreeModel/phaseRunnerModel unset); skipping",
+          );
+          return { dataHandles: [] };
+        }
+
+        const investigation = await context.readResource?.(
+          args.investigationId,
+        ) as z.infer<typeof InvestigationSchema> | null;
+        if (!investigation) {
+          throw new Error(`Investigation ${args.investigationId} not found`);
+        }
+
+        // Gate 1: a fixCandidate must exist — nothing to push otherwise.
+        const candidate = await findFixCandidateForInvestigation(
+          args.investigationId,
+          context,
+        );
+        if (!candidate) {
+          throw new Error(
+            `No fix candidate for investigation ${args.investigationId} — ` +
+              `call buildFixCandidate first`,
+          );
+        }
+
+        // Gate 2: candidate must not be expired.
+        if (isExpired(candidate.expiresAt)) {
+          throw new Error(
+            `Fix candidate ${candidate.candidateId} expired at ` +
+              `${candidate.expiresAt} — approval expired, rebuild needed ` +
+              `(call buildFixCandidate again).`,
+          );
+        }
+
+        // Gate 3: must be operator-approved, AND the recorded approvalHash
+        // must match the candidate's CURRENT hash — re-verified here rather
+        // than trusted from approve() time, in case the candidate was
+        // rebuilt (new hash) after approve() ran against a stale one.
+        const approved = await findApprovedAction(
+          args.investigationId,
+          context,
+        );
+        if (!approved) {
+          throw new Error(
+            `No approved action for investigation ${args.investigationId} — ` +
+              `refusing to push`,
+          );
+        }
+        if (
+          !approved.approvalHash ||
+          approved.approvalHash !== candidate.approvalHash
+        ) {
+          throw new Error(
+            `Approved action's hash does not match fix candidate ` +
+              `${candidate.candidateId}'s current approvalHash — refusing to ` +
+              `push. Re-approve with the candidate's current hash.`,
+          );
+        }
+
+        const worktreeId = `pr-${investigation.prNumber}-push`;
+        const repoParent = repoPath.split("/").slice(0, -1).join("/");
+        const worktreePath = `${repoParent}/${worktreeId}`;
+
+        const fixRunId = `fix-${investigation.prNumber}-${Date.now()}`;
+        const fixRun: z.infer<typeof FixRunSchema> = {
+          fixRunId,
+          investigationId: args.investigationId,
+          prNumber: investigation.prNumber,
+          headBranch: candidate.headBranch,
+          worktreeId,
+          worktreePath,
+          worktreeCreated: false,
+          checkoutOk: null,
+          buildOk: candidate.buildOk,
+          testOk: candidate.testOk,
+          shipOk: null,
+          worktreeRemoved: false,
+          success: false,
+          summary: "",
+          startedAt: new Date().toISOString(),
+        };
+
+        const finalize = async (
+          keepWorktree: boolean,
+        ): Promise<{ dataHandles: [Record<string, unknown>] }> => {
+          if (fixRun.worktreeCreated && !keepWorktree) {
+            const rm = await runModelMethod(
+              worktreeModel,
+              "remove",
+              { identifier: worktreeId },
+              toolRepoDir,
+            );
+            fixRun.worktreeRemoved = rm.success;
+            if (!rm.success) {
+              context.logger.warning(
+                "Worktree {id} teardown failed (manual cleanup needed): {err}",
+                { id: worktreeId, err: rm.error ?? "unknown" },
+              );
+            }
+          }
+          fixRun.finishedAt = new Date().toISOString();
+          const handle = await context.writeResource(
+            "fixRun",
+            fixRunId,
+            fixRun as unknown as Record<string, unknown>,
+          );
+          return { dataHandles: [handle] };
+        };
+
+        const notifyPushFailure = async (
+          phase: string,
+          resumable: boolean,
+        ): Promise<void> => {
+          const { ntfyTopic, ntfyBaseUrl, ntfyExtraTag } = context.globalArgs;
+          const lines = [investigation.prTitle, "", fixRun.summary];
+          if (resumable) {
+            lines.push(
+              "",
+              `Worktree kept: ${worktreePath}`,
+              `Resume: cd ${worktreePath} and finish the push by hand`,
+            );
+          } else {
+            lines.push("", "Worktree cleaned up (nothing to resume).");
+          }
+          try {
+            await fetch(`${ntfyBaseUrl}/${ntfyTopic}`, {
+              method: "POST",
+              headers: {
+                "Title": asciiHeader(
+                  `PR #${investigation.prNumber} push FAILED at ${phase}`,
+                ),
+                "Priority": "4",
+                "Tags": ntfyExtraTag ? `x,${ntfyExtraTag}` : "x",
+                "Click": investigation.prUrl,
+              },
+              body: lines.join("\n"),
+            });
+          } catch (err) {
+            context.logger.warning(
+              "Failure notification could not be sent: {err}",
+              { err: err instanceof Error ? err.message : String(err) },
+            );
+          }
+        };
+
+        const fail = async (
+          phase: string,
+          detail: string,
+        ): Promise<{ dataHandles: [Record<string, unknown>] }> => {
+          fixRun.summary = `${phase} failed: ${detail}`.slice(0, 500);
+          context.logger.error(
+            "pushApprovedFix PR #{prNumber} {phase}: {detail}",
+            { prNumber: investigation.prNumber, phase, detail },
+          );
+          const resumable = ["apply-bundle", "ship"].includes(phase);
+          if (!suppressFixNotifications) {
+            await notifyPushFailure(phase, resumable);
+          }
+          return await finalize(resumable);
+        };
+
+        const notifyPushSuccess = async (): Promise<void> => {
+          const { ntfyTopic, ntfyBaseUrl, ntfyExtraTag } = context.globalArgs;
+          try {
+            await fetch(`${ntfyBaseUrl}/${ntfyTopic}`, {
+              method: "POST",
+              headers: {
+                "Title": `PR #${investigation.prNumber} fix pushed`,
+                "Priority": "3",
+                "Tags": ntfyExtraTag
+                  ? `white_check_mark,${ntfyExtraTag}`
+                  : "white_check_mark",
+                "Click": investigation.prUrl,
+              },
+              body: [
+                investigation.prTitle,
+                "",
+                `Built, tested, and pushed to ${candidate.headBranch}.`,
+              ].join("\n"),
+            });
+          } catch (err) {
+            context.logger.warning(
+              "Success notification could not be sent: {err}",
+              { err: err instanceof Error ? err.message : String(err) },
+            );
+          }
+        };
+
+        context.logger.info(
+          "pushApprovedFix PR #{prNumber}: pushing candidate {id} to {branch}",
+          {
+            prNumber: investigation.prNumber,
+            id: candidate.candidateId,
+            branch: candidate.headBranch,
+          },
+        );
+
+        // Actor-scope token for the push. Degrades to null (ambient gh
+        // auth) until the org PATs land — see resolveGithubToken's TODO.
+        const actorToken = await resolveGithubToken("actor", context, "push");
+        const actorEnv = actorToken ? { GH_TOKEN: actorToken } : undefined;
+        if (!actorToken) {
+          context.logger.warning(
+            "pushApprovedFix PR #{prNumber}: no actor PAT available, using ambient gh auth (fallback, not fail-closed — TODO once PATs land)",
+            { prNumber: investigation.prNumber },
+          );
+        }
+
+        // 1) FRESH worktree — never reuse buildFixCandidate's (already torn
+        // down) worktree, so the push side re-verifies everything from a
+        // clean checkout rather than trusting cached worktree state.
+        const add = await runModelMethod(
+          worktreeModel,
+          "add",
+          { identifier: worktreeId },
+          toolRepoDir,
+        );
+        if (!add.success) {
+          return await fail("worktree-add", add.error ?? "unknown");
+        }
+        fixRun.worktreeCreated = true;
+
+        try {
+          const st = await Deno.stat(worktreePath);
+          if (!st.isDirectory) throw new Error("not a directory");
+        } catch {
+          return await fail(
+            "worktree-verify",
+            `expected worktree at ${worktreePath} but it is absent`,
+          );
+        }
+
+        // 2) Fetch and RE-VERIFY the PR head is unchanged since the
+        // candidate was built. This is the head-moved refusal: if someone
+        // pushed to the PR branch (or force-pushed) after the fix was
+        // built, the candidate's diff no longer applies cleanly against
+        // "the current PR" and pushing it would silently clobber whatever
+        // landed on the branch in the meantime.
+        const fetchResult = await runGitIn(worktreePath, [
+          "fetch",
+          "origin",
+          candidate.headBranch,
+        ], actorEnv);
+        if (!fetchResult.success) {
+          fixRun.checkoutOk = false;
+          return await fail("git-fetch", fetchResult.stderr.slice(0, 300));
+        }
+        const currentHeadResult = await runGitIn(worktreePath, [
+          "rev-parse",
+          `origin/${candidate.headBranch}`,
+        ]);
+        if (!currentHeadResult.success) {
+          return await fail(
+            "git-rev-parse-head",
+            currentHeadResult.stderr.slice(0, 300),
+          );
+        }
+        const currentHeadSha = currentHeadResult.stdout.trim();
+        if (headHasMoved(candidate.headSha, currentHeadSha)) {
+          return await fail(
+            "head-moved",
+            `PR head moved since build — rebuild needed (candidate built on ` +
+              `${candidate.headSha.slice(0, 12)}, branch is now at ` +
+              `${currentHeadSha.slice(0, 12)})`,
+          );
+        }
+        fixRun.checkoutOk = true;
+
+        const checkout = await runGitIn(worktreePath, [
+          "checkout",
+          candidate.headBranch,
+        ]);
+        if (!checkout.success) {
+          return await fail("git-checkout", checkout.stderr.slice(0, 300));
+        }
+        await runGitIn(worktreePath, [
+          "reset",
+          "--hard",
+          `origin/${candidate.headBranch}`,
+        ]);
+
+        // 3) Apply the bundle: fetch the exact commit out of the bundle
+        // file (a bundle is fetchable like any remote), then check it out
+        // onto headBranch — this lands EXACTLY candidate.commitSha, not a
+        // re-derived equivalent.
+        const bundleFetch = await runGitIn(worktreePath, [
+          "fetch",
+          candidate.bundlePath,
+          candidate.commitSha,
+        ]);
+        if (!bundleFetch.success) {
+          return await fail(
+            "apply-bundle",
+            bundleFetch.stderr.slice(0, 300),
+          );
+        }
+        const bundleCheckout = await runGitIn(worktreePath, [
+          "checkout",
+          "-B",
+          candidate.headBranch,
+          "FETCH_HEAD",
+        ]);
+        if (!bundleCheckout.success) {
+          return await fail(
+            "apply-bundle",
+            bundleCheckout.stderr.slice(0, 300),
+          );
+        }
+
+        // Verify the landed commit is EXACTLY the approved one.
+        const landedShaResult = await runGitIn(worktreePath, [
+          "rev-parse",
+          "HEAD",
+        ]);
+        if (
+          !landedShaResult.success ||
+          landedShaResult.stdout.trim() !== candidate.commitSha
+        ) {
+          return await fail(
+            "apply-bundle",
+            `landed HEAD (${
+              landedShaResult.stdout.trim().slice(0, 12)
+            }) does not match approved commit (${
+              candidate.commitSha.slice(0, 12)
+            })`,
+          );
+        }
+
+        // Defense-in-depth: recompute the hash over what's actually on disk
+        // right now and confirm it equals the approved hash — the pushed
+        // content is exactly what was approved, not just "a commit with the
+        // right sha" (a sha collision or a tampered bundle file would still
+        // be caught here since the diff is recomputed from the real tree).
+        const appliedDiffResult = await runGitIn(worktreePath, [
+          "diff",
+          `${candidate.headSha}..HEAD`,
+        ]);
+        if (!appliedDiffResult.success) {
+          return await fail(
+            "verify-hash",
+            appliedDiffResult.stderr.slice(0, 300),
+          );
+        }
+        const recomputedHash = await computeApprovalHash({
+          diff: appliedDiffResult.stdout,
+          commitSha: candidate.commitSha,
+          headSha: candidate.headSha,
+          repo: candidate.repo,
+          actionType: "push_fix",
+          headBranch: candidate.headBranch,
+          expiresAt: candidate.expiresAt,
+        });
+        if (recomputedHash !== candidate.approvalHash) {
+          return await fail(
+            "verify-hash",
+            "recomputed hash over the applied diff does not match the " +
+              "approved approvalHash — refusing to push unverified content",
+          );
+        }
+
+        // 4) Ship: submit from the worktree updates the PR branch in place.
+        // Prefer the existing ship mechanism (Graphite `gt submit`) over a
+        // raw `git push` to match how every other fix path lands PRs.
         const ship = await runModelMethod(
           phaseRunnerModel,
           "ship",
-          { branchName: headBranch, repoPath: worktreePath },
+          { branchName: candidate.headBranch, repoPath: worktreePath },
           toolRepoDir,
+          actorEnv,
         );
         fixRun.shipOk = ship.success;
         if (!ship.success) {
           return await fail("ship", ship.error ?? "submit failed");
         }
 
-        // Pull the PR url out of the ship artifact if present.
         const shipArtifact = (ship.data?.dataArtifacts as
           | Array<{ attributes?: { prUrl?: string } }>
           | undefined)?.[0]?.attributes;
         if (shipArtifact?.prUrl) fixRun.prUrl = shipArtifact.prUrl;
 
         fixRun.success = true;
-        fixRun.summary =
-          `Fix built, tested, and pushed to ${headBranch} (PR #${investigation.prNumber})`;
+        fixRun.summary = `Fix ${
+          candidate.commitSha.slice(0, 12)
+        } pushed to ${candidate.headBranch} (PR #${investigation.prNumber})`;
         context.logger.info(
-          "executeWorktreeFix PR #{prNumber} SUCCEEDED — pushed to {branch}",
-          { prNumber: investigation.prNumber, branch: headBranch },
+          "pushApprovedFix PR #{prNumber} SUCCEEDED — pushed {sha} to {branch}",
+          {
+            prNumber: investigation.prNumber,
+            sha: candidate.commitSha.slice(0, 12),
+            branch: candidate.headBranch,
+          },
         );
 
-        if (!suppressFixNotifications) await notifyFixSuccess();
+        if (!suppressFixNotifications) await notifyPushSuccess();
         return await finalize(false);
       },
     },
