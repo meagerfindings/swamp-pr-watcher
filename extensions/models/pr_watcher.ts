@@ -99,25 +99,26 @@ const GlobalArgsSchema = z.object({
    * fix still runs and is audited identically. */
   suppressFixNotifications: z.boolean().default(false),
   /** Sandbox mode forwarded to cli-agent's invoke/invokeAndParse for the
-   * investigate phase. "off" runs the CLI agent unsandboxed (current
-   * behavior); "seatbelt" wraps it in a macOS Seatbelt sandbox (deny ambient
-   * secrets, protect credential files, restrict writes to cwd, allow
-   * egress). Default "off" — an instance opts in once a sandboxed run is
-   * proven. */
-  sandboxMode: z.enum(["off", "seatbelt"]).default("off").describe(
-    "Sandbox mode passed to cli-agent for the investigate phase: 'off' " +
-      "(default, unsandboxed) or 'seatbelt' (macOS Seatbelt: deny ambient " +
-      "secrets, protect credentials, restrict writes to cwd, allow egress).",
-  ),
+   * investigate phase. Default "auto" — cli-agent itself picks the OS-native
+   * backend (Seatbelt on macOS, bwrap on Linux). "off" opts out of
+   * sandboxing entirely; "seatbelt"/"bwrap" pin a specific backend. */
+  sandboxMode: z.enum(["off", "auto", "seatbelt", "bwrap"]).default("auto")
+    .describe(
+      "Sandbox mode passed to cli-agent for the investigate phase: default " +
+        "'auto' (cli-agent picks Seatbelt on macOS or bwrap on Linux); " +
+        "'off' opts out; 'seatbelt' or 'bwrap' pin a specific backend. " +
+        "Forwarded to cli-agent.",
+    ),
   /** Whether cli-agent must fail closed (throw) if sandboxMode can't be
-   * applied, rather than degrade-with-warning. default false =
-   * warn-and-degrade; the PR-watcher instance sets true (fail-closed) once a
-   * real sandboxed run is proven. */
-  sandboxRequired: z.boolean().default(false).describe(
-    "If true, cli-agent fails closed (throws) when the requested " +
-      "sandboxMode can't be applied instead of degrading with a warning. " +
-      "default false = warn-and-degrade; the PR-watcher instance sets true " +
-      "(fail-closed) once a real sandboxed run is proven.",
+   * applied, rather than degrade-with-warning. Default true: the investigate
+   * phase ingests untrusted PR text, so it fails closed by design — if the
+   * OS sandbox can't be applied, investigate refuses to run rather than run
+   * unconfined. An instance can set false to warn-and-degrade instead. */
+  sandboxRequired: z.boolean().default(true).describe(
+    "If true (default), cli-agent fails closed (throws) when the " +
+      "requested sandboxMode can't be applied instead of degrading with a " +
+      "warning. The investigate phase ingests untrusted PR text, so it " +
+      "fails closed by design; set false to warn-and-degrade instead.",
   ),
 });
 
@@ -434,12 +435,12 @@ type InvokeCliAgentOpts = {
   wallTimeoutMs: number;
   parse: boolean;
   toolProfile?: "readonly" | "actor";
-  /** Forwarded to cli-agent's `sandboxMode` (default "off" — see
-   * GlobalArgsSchema.sandboxMode). "seatbelt" wraps the spawned CLI in a
-   * macOS Seatbelt sandbox (deny ambient secrets, protect credential files,
-   * restrict writes to cwd, allow egress). */
-  sandboxMode?: "off" | "seatbelt";
-  /** Forwarded to cli-agent's `sandboxRequired` (default false — see
+  /** Forwarded to cli-agent's `sandboxMode` (default "auto" — see
+   * GlobalArgsSchema.sandboxMode). "auto" lets cli-agent pick the OS-native
+   * backend (Seatbelt on macOS, bwrap on Linux); "seatbelt"/"bwrap" pin a
+   * specific backend; "off" opts out. */
+  sandboxMode?: "off" | "auto" | "seatbelt" | "bwrap";
+  /** Forwarded to cli-agent's `sandboxRequired` (default true — see
    * GlobalArgsSchema.sandboxRequired). When true, cli-agent fails closed if
    * the sandbox can't be applied instead of degrading with a warning. */
   sandboxRequired?: boolean;
@@ -1146,6 +1147,71 @@ type MethodContext = {
 };
 
 /**
+ * Pure construction of the loud halt notification's title/body for a
+ * fail-closed investigate failure (sandboxRequired=true, sandbox unavailable
+ * or otherwise). Extracted from `notifyInvestigateHalt` so the message
+ * content is unit-testable without a network call — see pr_watcher_test.ts.
+ */
+export function buildInvestigateHaltNotification(
+  prNumber: number,
+  prTitle: string,
+  error: string,
+): { title: string; body: string } {
+  return {
+    title: `PR investigate HALTED — sandbox unavailable`,
+    body: [
+      `PR #${prNumber}: ${prTitle}`,
+      "",
+      "The investigate phase fails closed by design (sandboxRequired=true) " +
+      "when the OS sandbox can't be applied — it refuses to run " +
+      "unconfined against untrusted PR text rather than degrade silently.",
+      "",
+      `Error: ${error}`,
+    ].join("\n"),
+  };
+}
+
+/**
+ * Best-effort loud ntfy notification for a fail-closed investigate halt. A
+ * silent fail-closed halt is indistinguishable from a healthy idle watcher,
+ * so this must be noisy — but a notify failure must never mask the original
+ * investigate error, hence the try/catch that only logs.
+ */
+async function notifyInvestigateHalt(
+  prNumber: number,
+  prTitle: string,
+  prUrl: string,
+  error: string,
+  context: MethodContext,
+): Promise<void> {
+  const { ntfyTopic, ntfyBaseUrl, ntfyExtraTag } = context.globalArgs;
+  const { title, body } = buildInvestigateHaltNotification(
+    prNumber,
+    prTitle,
+    error,
+  );
+  try {
+    await fetch(`${ntfyBaseUrl}/${ntfyTopic}`, {
+      method: "POST",
+      headers: {
+        "Title": asciiHeader(title),
+        "Priority": "5",
+        "Tags": asciiHeader(
+          ntfyExtraTag ? `rotating_light,${ntfyExtraTag}` : "rotating_light",
+        ),
+        "Click": prUrl,
+      },
+      body,
+    });
+  } catch (err) {
+    context.logger.warning(
+      "Investigate-halt notification could not be sent: {err}",
+      { err: err instanceof Error ? err.message : String(err) },
+    );
+  }
+}
+
+/**
  * Per-PR investigation, shared by the single `investigate` method and the
  * `investigateBatch` fan-out. Returns the investigation object; the caller is
  * responsible for persisting it via writeResource. Throws on no-events or a
@@ -1241,7 +1307,7 @@ async function runInvestigation(
       // sanitizer/fence discussion) — exactly where OS-level sandboxing of
       // the spawned CLI matters most. Threaded from global args so an
       // instance can opt in without a code change; defaults stay safe
-      // (off / not-required) here.
+      // (auto / fail-closed) here.
       sandboxMode,
       sandboxRequired,
     },
@@ -1249,9 +1315,21 @@ async function runInvestigation(
   );
 
   if (!agentResult.success || !agentResult.output) {
-    throw new Error(
-      `Investigation agent failed: ${agentResult.error ?? "unknown error"}`,
-    );
+    const errorMessage = agentResult.error ?? "unknown error";
+    // A fail-closed investigate halt (sandboxRequired=true, sandbox
+    // unavailable) looks IDENTICAL to a healthy idle watcher from the
+    // outside — both are silent. That's the one failure mode this phase must
+    // never go quiet on, so notify loudly (best-effort) before throwing.
+    if (sandboxRequired) {
+      await notifyInvestigateHalt(
+        prNumber,
+        firstEvent.prTitle,
+        firstEvent.prUrl,
+        errorMessage,
+        context,
+      );
+    }
+    throw new Error(`Investigation agent failed: ${errorMessage}`);
   }
 
   const parsed = agentResult.output as {

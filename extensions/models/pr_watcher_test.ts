@@ -11,6 +11,7 @@ import { assert, assertEquals, assertStringIncludes } from "jsr:@std/assert@1";
 import {
   asciiHeader,
   buildCliAgentInput,
+  buildInvestigateHaltNotification,
   buildInvestigationPrompt,
   canonicalApprovalString,
   computeApprovalHash,
@@ -515,19 +516,19 @@ Deno.test("buildCliAgentInput leaves sandboxMode/sandboxRequired undefined when 
 
 // --- GlobalArgsSchema: sandbox defaults -----------------------------------
 //
-// The pr-watcher instance opts into the sandbox via global args (no code
-// change needed) — these lock in that the shipped defaults stay safe:
-// sandboxing off, and not fail-closed, until an instance configures
-// otherwise.
+// The investigate phase ingests untrusted PR text, so it defaults to
+// sandbox-on and fail-closed: sandboxMode "auto" (cli-agent picks the
+// OS-native backend) and sandboxRequired true (refuse to run unconfined if
+// the sandbox can't be applied). An instance can still opt out.
 
-Deno.test("global args default sandboxMode to off", () => {
+Deno.test("global args default sandboxMode to auto", () => {
   const parsed = model.globalArguments.parse({});
-  assertEquals(parsed.sandboxMode, "off");
+  assertEquals(parsed.sandboxMode, "auto");
 });
 
-Deno.test("global args default sandboxRequired to false", () => {
+Deno.test("global args default sandboxRequired to true", () => {
   const parsed = model.globalArguments.parse({});
-  assertEquals(parsed.sandboxRequired, false);
+  assertEquals(parsed.sandboxRequired, true);
 });
 
 Deno.test("global args accept an explicit seatbelt + fail-closed opt-in", () => {
@@ -537,4 +538,46 @@ Deno.test("global args accept an explicit seatbelt + fail-closed opt-in", () => 
   });
   assertEquals(parsed.sandboxMode, "seatbelt");
   assertEquals(parsed.sandboxRequired, true);
+});
+
+Deno.test("global args accept bwrap and an explicit opt-out", () => {
+  const parsed = model.globalArguments.parse({
+    sandboxMode: "bwrap",
+    sandboxRequired: false,
+  });
+  assertEquals(parsed.sandboxMode, "bwrap");
+  assertEquals(parsed.sandboxRequired, false);
+});
+
+Deno.test("global args accept off to opt out of sandboxing entirely", () => {
+  const parsed = model.globalArguments.parse({ sandboxMode: "off" });
+  assertEquals(parsed.sandboxMode, "off");
+});
+
+// --- buildInvestigateHaltNotification ---------------------------------------
+//
+// The fail-closed halt notify is the one failure mode that must never go
+// silent — a halted investigate looks identical to a healthy idle watcher
+// from the outside. These lock in that the message names the PR, states the
+// fail-closed-by-design posture, and includes the underlying error.
+
+Deno.test("buildInvestigateHaltNotification titles the halt clearly", () => {
+  const { title } = buildInvestigateHaltNotification(
+    42,
+    "Fix the thing",
+    "sandbox unavailable: bwrap not installed",
+  );
+  assertEquals(title, "PR investigate HALTED — sandbox unavailable");
+});
+
+Deno.test("buildInvestigateHaltNotification body names the PR and the error", () => {
+  const { body } = buildInvestigateHaltNotification(
+    42,
+    "Fix the thing",
+    "sandbox unavailable: bwrap not installed",
+  );
+  assertStringIncludes(body, "PR #42");
+  assertStringIncludes(body, "Fix the thing");
+  assertStringIncludes(body, "sandbox unavailable: bwrap not installed");
+  assertStringIncludes(body, "fails closed by design");
 });
