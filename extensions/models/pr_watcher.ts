@@ -657,9 +657,12 @@ async function loadFeedbackEvents(
  * - Bare URLs are defanged in free text only (`diffHunk` may legitimately
  *   contain URLs in code/comments, so callers pass `isDiff: true` to skip
  *   that step there).
+ * - Literal `<untrusted-data`/`</untrusted-data` tags are neutralized so a
+ *   crafted value cannot close the fence early and place text outside it.
  */
 function sanitizeUntrusted(s: string, isDiff = false): string {
   let out = s
+    .replace(/<\/?\s*untrusted-data/gi, "[tag removed]")
     .replace(/<!--[\s\S]*?-->/g, "[html comment removed]")
     .replace(/[​-‍﻿‪-‮⁦-⁩]/g, "")
     .replace(/!\[([^\]]*)\]\(([^)]*)\)/g, "[image removed: $1]");
