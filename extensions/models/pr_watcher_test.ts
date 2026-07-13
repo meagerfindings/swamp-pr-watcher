@@ -10,12 +10,14 @@
 import { assert, assertEquals, assertStringIncludes } from "jsr:@std/assert@1";
 import {
   asciiHeader,
+  buildCliAgentInput,
   buildInvestigationPrompt,
   canonicalApprovalString,
   computeApprovalHash,
   type FeedbackEvent,
   headHasMoved,
   isExpired,
+  model,
   resolveRepoDir,
 } from "./pr_watcher.ts";
 
@@ -463,4 +465,76 @@ Deno.test("headHasMoved is false when shas match", () => {
 
 Deno.test("headHasMoved is true when shas differ (branch advanced or was force-pushed)", () => {
   assertEquals(headHasMoved("abc123", "def456"), true);
+});
+
+// --- buildCliAgentInput ---------------------------------------------------
+//
+// Covers the sandboxMode/sandboxRequired pass-through into the cli-agent
+// invoke/invokeAndParse input object, mirroring how toolProfile is threaded.
+// invokeCliAgent itself shells out (or calls context.runModel) and isn't
+// directly unit-testable, so the pure input-object construction is extracted
+// into buildCliAgentInput and tested here instead.
+
+const baseCliAgentOpts = {
+  prompt: "investigate",
+  provider: "claude",
+  model: "sonnet",
+  cwd: "/repo",
+  tags: { phase: "pr-watch-investigate" },
+  wallTimeoutMs: 300_000,
+  parse: true,
+};
+
+Deno.test("buildCliAgentInput forwards toolProfile alongside the base fields", () => {
+  const input = buildCliAgentInput({
+    ...baseCliAgentOpts,
+    toolProfile: "readonly",
+  });
+  assertEquals(input.toolProfile, "readonly");
+  assertEquals(input.prompt, "investigate");
+  assertEquals(input.cwd, "/repo");
+});
+
+Deno.test("buildCliAgentInput forwards sandboxMode and sandboxRequired", () => {
+  const input = buildCliAgentInput({
+    ...baseCliAgentOpts,
+    toolProfile: "readonly",
+    sandboxMode: "seatbelt",
+    sandboxRequired: true,
+  });
+  assertEquals(input.sandboxMode, "seatbelt");
+  assertEquals(input.sandboxRequired, true);
+});
+
+Deno.test("buildCliAgentInput leaves sandboxMode/sandboxRequired undefined when omitted", () => {
+  const input = buildCliAgentInput({ ...baseCliAgentOpts });
+  assertEquals(input.sandboxMode, undefined);
+  assertEquals(input.sandboxRequired, undefined);
+  assertEquals(input.toolProfile, undefined);
+});
+
+// --- GlobalArgsSchema: sandbox defaults -----------------------------------
+//
+// The pr-watcher instance opts into the sandbox via global args (no code
+// change needed) — these lock in that the shipped defaults stay safe:
+// sandboxing off, and not fail-closed, until an instance configures
+// otherwise.
+
+Deno.test("global args default sandboxMode to off", () => {
+  const parsed = model.globalArguments.parse({});
+  assertEquals(parsed.sandboxMode, "off");
+});
+
+Deno.test("global args default sandboxRequired to false", () => {
+  const parsed = model.globalArguments.parse({});
+  assertEquals(parsed.sandboxRequired, false);
+});
+
+Deno.test("global args accept an explicit seatbelt + fail-closed opt-in", () => {
+  const parsed = model.globalArguments.parse({
+    sandboxMode: "seatbelt",
+    sandboxRequired: true,
+  });
+  assertEquals(parsed.sandboxMode, "seatbelt");
+  assertEquals(parsed.sandboxRequired, true);
 });

@@ -98,6 +98,27 @@ const GlobalArgsSchema = z.object({
    * apply quiet-hours deferral the generic engine shouldn't bake in). The
    * fix still runs and is audited identically. */
   suppressFixNotifications: z.boolean().default(false),
+  /** Sandbox mode forwarded to cli-agent's invoke/invokeAndParse for the
+   * investigate phase. "off" runs the CLI agent unsandboxed (current
+   * behavior); "seatbelt" wraps it in a macOS Seatbelt sandbox (deny ambient
+   * secrets, protect credential files, restrict writes to cwd, allow
+   * egress). Default "off" — an instance opts in once a sandboxed run is
+   * proven. */
+  sandboxMode: z.enum(["off", "seatbelt"]).default("off").describe(
+    "Sandbox mode passed to cli-agent for the investigate phase: 'off' " +
+      "(default, unsandboxed) or 'seatbelt' (macOS Seatbelt: deny ambient " +
+      "secrets, protect credentials, restrict writes to cwd, allow egress).",
+  ),
+  /** Whether cli-agent must fail closed (throw) if sandboxMode can't be
+   * applied, rather than degrade-with-warning. default false =
+   * warn-and-degrade; the PR-watcher instance sets true (fail-closed) once a
+   * real sandboxed run is proven. */
+  sandboxRequired: z.boolean().default(false).describe(
+    "If true, cli-agent fails closed (throws) when the requested " +
+      "sandboxMode can't be applied instead of degrading with a warning. " +
+      "default false = warn-and-degrade; the PR-watcher instance sets true " +
+      "(fail-closed) once a real sandboxed run is proven.",
+  ),
 });
 
 /** A single action the investigation agent proposes for a piece of feedback. */
@@ -401,6 +422,52 @@ function normalizeCliAgentArtifact(
 }
 
 /**
+ * Options accepted by `invokeCliAgent`, and the shape `buildCliAgentInput`
+ * turns into the cli-agent `invoke`/`invokeAndParse` input object.
+ */
+type InvokeCliAgentOpts = {
+  prompt: string;
+  provider: string;
+  model: string;
+  cwd: string;
+  tags: Record<string, string>;
+  wallTimeoutMs: number;
+  parse: boolean;
+  toolProfile?: "readonly" | "actor";
+  /** Forwarded to cli-agent's `sandboxMode` (default "off" — see
+   * GlobalArgsSchema.sandboxMode). "seatbelt" wraps the spawned CLI in a
+   * macOS Seatbelt sandbox (deny ambient secrets, protect credential files,
+   * restrict writes to cwd, allow egress). */
+  sandboxMode?: "off" | "seatbelt";
+  /** Forwarded to cli-agent's `sandboxRequired` (default false — see
+   * GlobalArgsSchema.sandboxRequired). When true, cli-agent fails closed if
+   * the sandbox can't be applied instead of degrading with a warning. */
+  sandboxRequired?: boolean;
+};
+
+/**
+ * Pure construction of the cli-agent `invoke`/`invokeAndParse` input object
+ * from `invokeCliAgent`'s opts — extracted so the toolProfile/sandbox
+ * pass-through is unit-testable without shelling out (see
+ * pr_watcher_test.ts).
+ */
+export function buildCliAgentInput(
+  opts: InvokeCliAgentOpts,
+): Record<string, unknown> {
+  return {
+    prompt: opts.prompt,
+    provider: opts.provider,
+    model: opts.model,
+    cwd: opts.cwd,
+    tags: opts.tags,
+    wallTimeoutMs: opts.wallTimeoutMs,
+    toolProfile: opts.toolProfile,
+    sandboxMode: opts.sandboxMode,
+    sandboxRequired: opts.sandboxRequired,
+  };
+}
+
+/**
  * Invoke the CLI-agent model (`invoke` or `invokeAndParse`) and normalize its
  * envelope into `{ success, output, error }`. Attempts `context.runModel`
  * first (in-process, no subprocess); falls back to the shelled `swamp model
@@ -413,16 +480,7 @@ function normalizeCliAgentArtifact(
 async function invokeCliAgent(
   cliAgentModel: string,
   repoDir: string,
-  opts: {
-    prompt: string;
-    provider: string;
-    model: string;
-    cwd: string;
-    tags: Record<string, string>;
-    wallTimeoutMs: number;
-    parse: boolean;
-    toolProfile?: "readonly" | "actor";
-  },
+  opts: InvokeCliAgentOpts,
   context?: MethodContext,
 ): Promise<{
   success: boolean;
@@ -430,15 +488,7 @@ async function invokeCliAgent(
   error?: string;
 }> {
   const method = opts.parse ? "invokeAndParse" : "invoke";
-  const inputs: Record<string, unknown> = {
-    prompt: opts.prompt,
-    provider: opts.provider,
-    model: opts.model,
-    cwd: opts.cwd,
-    tags: opts.tags,
-    wallTimeoutMs: opts.wallTimeoutMs,
-    toolProfile: opts.toolProfile,
-  };
+  const inputs: Record<string, unknown> = buildCliAgentInput(opts);
 
   // cli-agent runs in-process under the parent's datastore lock; no mutual
   // exclusion vs concurrent external writers.
@@ -1117,6 +1167,8 @@ async function runInvestigation(
     investigateModelId,
     investigateTimeoutMs,
     subCallRepoDir,
+    sandboxMode,
+    sandboxRequired,
   } = context.globalArgs;
 
   const repoDir = resolveRepoDir();
@@ -1185,6 +1237,13 @@ async function runInvestigation(
       // actions but never executes fixes here (see act/executeWorktreeFix
       // for the write-capable phase), so restrict it to Read/Grep/Glob.
       toolProfile: "readonly",
+      // Investigation ingests untrusted PR text (see the module doc's
+      // sanitizer/fence discussion) — exactly where OS-level sandboxing of
+      // the spawned CLI matters most. Threaded from global args so an
+      // instance can opt in without a code change; defaults stay safe
+      // (off / not-required) here.
+      sandboxMode,
+      sandboxRequired,
     },
     context,
   );
