@@ -1716,7 +1716,7 @@ async function sendFixCandidateApprovalNotification(
  */
 export const model = {
   type: "@mgreten/pr-watcher",
-  version: "2026.07.13.1",
+  version: "2026.07.14.1",
   globalArguments: GlobalArgsSchema,
   resources: {
     investigation: {
