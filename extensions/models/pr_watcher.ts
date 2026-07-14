@@ -938,8 +938,9 @@ async function ensureInvestigateWorktree(
   // first repo's files whenever a same-named ref exists there).
   const parts = repoPath.split("/");
   const repoParent = parts.slice(0, -1).join("/");
-  const worktreePath =
-    `${repoParent}/${parts[parts.length - 1]}-pr-watcher-investigate`;
+  const worktreePath = `${repoParent}/${
+    parts[parts.length - 1]
+  }-pr-watcher-investigate`;
 
   let exists = false;
   try {
@@ -1497,7 +1498,11 @@ async function runInvestigation(
   // Reader-scope token for the read-only investigate phase (fetch, gh pr
   // diff). Degrades to null (ambient gh/git auth) until the org PATs land —
   // see resolveGithubToken's TODO.
-  const readerToken = await resolveGithubToken("reader", context, "investigate");
+  const readerToken = await resolveGithubToken(
+    "reader",
+    context,
+    "investigate",
+  );
   const readerEnv = readerToken ? { GH_TOKEN: readerToken } : undefined;
 
   // Ground the agent in the PR's actual state: its readonly tool profile has
