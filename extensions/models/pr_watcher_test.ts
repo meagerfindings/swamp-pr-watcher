@@ -18,9 +18,11 @@ import {
   type FeedbackEvent,
   headHasMoved,
   isExpired,
+  isRunModelResolutionFailure,
   isSandboxFailClosedError,
   MAX_EMBEDDED_DIFF_CHARS,
   model,
+  normalizeCliAgentArtifact,
   resolveRepoDir,
   truncateEmbeddedDiff,
 } from "./pr_watcher.ts";
@@ -719,4 +721,198 @@ Deno.test("buildInvestigateHaltNotification body names the PR and the error", ()
   assertStringIncludes(body, "Fix the thing");
   assertStringIncludes(body, "sandbox unavailable: bwrap not installed");
   assertStringIncludes(body, "fails closed by design");
+});
+
+// --- schemas and deterministic error boundaries -----------------------------
+
+Deno.test("investigation resource schema accepts the complete contract", () => {
+  const parsed = model.resources.investigation.schema.parse({
+    investigationId: "inv-42",
+    prNumber: 42,
+    prTitle: "Add widget",
+    prUrl: "https://example/pr/42",
+    eventIds: ["event-1"],
+    summary: "One actionable review comment",
+    proposedActions: [{
+      type: "push_fix",
+      target: "lib/widget.rb:17",
+      content: "Correct the nil guard",
+      confidence: 0.9,
+    }],
+    context: { filesReferenced: ["lib/widget.rb"], diffSummary: "+ guard" },
+    hasHumanFeedback: true,
+    investigatedAt: "2026-07-16T00:00:00.000Z",
+  });
+  assertEquals(parsed.proposedActions[0].type, "push_fix");
+});
+
+Deno.test("investigation resource schema rejects action confidence outside 0..1", () => {
+  const result = model.resources.investigation.schema.safeParse({
+    investigationId: "inv-42",
+    prNumber: 42,
+    prTitle: "Add widget",
+    prUrl: "https://example/pr/42",
+    eventIds: [],
+    summary: "summary",
+    proposedActions: [{ type: "dismiss", content: "noise", confidence: 1.01 }],
+    context: { filesReferenced: [], diffSummary: "" },
+    hasHumanFeedback: false,
+    investigatedAt: "2026-07-16T00:00:00.000Z",
+  });
+  assertEquals(result.success, false);
+});
+
+Deno.test("action resource schema enforces decision enum", () => {
+  const schema = model.resources.action.schema;
+  assertEquals(schema.safeParse({
+    actionId: "action-1",
+    investigationId: "inv-42",
+    prNumber: 42,
+    eventIds: ["event-1"],
+    decision: "approved",
+    approvalHash: "abc",
+  }).success, true);
+  assertEquals(schema.safeParse({
+    actionId: "action-1",
+    investigationId: "inv-42",
+    prNumber: 42,
+    eventIds: [],
+    decision: "silently_ship",
+  }).success, false);
+});
+
+Deno.test("fixRun resource schema preserves nullable phase boundaries", () => {
+  const parsed = model.resources.fixRun.schema.parse({
+    fixRunId: "run-1",
+    investigationId: "inv-42",
+    prNumber: 42,
+    headBranch: "feature/widget",
+    worktreeId: "wt-1",
+    worktreePath: "/tmp/wt-1",
+    worktreeCreated: false,
+    checkoutOk: null,
+    buildOk: null,
+    testOk: null,
+    shipOk: null,
+    worktreeRemoved: false,
+    success: false,
+    summary: "creation failed",
+    startedAt: "2026-07-16T00:00:00.000Z",
+  });
+  assertEquals(parsed.checkoutOk, null);
+  assertEquals(parsed.success, false);
+});
+
+Deno.test("fixCandidate resource schema requires build and test outcomes", () => {
+  const candidate = {
+    candidateId: "candidate-1",
+    investigationId: "inv-42",
+    prNumber: 42,
+    headBranch: "feature/widget",
+    commitSha: "abc123",
+    headSha: "def456",
+    repo: "octocat/hello-world",
+    bundlePath: "/tmp/fix.bundle",
+    diff: "+fixed",
+    approvalHash: "hash",
+    expiresAt: "2026-07-17T00:00:00.000Z",
+    builtAt: "2026-07-16T00:00:00.000Z",
+    buildOk: true,
+    testOk: true,
+  };
+  assertEquals(model.resources.fixCandidate.schema.safeParse(candidate).success, true);
+  const { testOk: _omitted, ...missingOutcome } = candidate;
+  assertEquals(
+    model.resources.fixCandidate.schema.safeParse(missingOutcome).success,
+    false,
+  );
+});
+
+Deno.test("method argument schemas enforce non-empty batch and required IDs", () => {
+  assertEquals(
+    model.methods.investigateBatch.arguments.safeParse({ prNumbers: [] }).success,
+    false,
+  );
+  assertEquals(
+    model.methods.investigateBatch.arguments.safeParse({ prNumbers: [1, 2] }).success,
+    true,
+  );
+  assertEquals(model.methods.notify.arguments.safeParse({}).success, false);
+  assertEquals(
+    model.methods.notify.arguments.safeParse({ investigationId: "inv-42" }).success,
+    true,
+  );
+});
+
+Deno.test("global args reject unsupported sandbox modes", () => {
+  assertEquals(
+    model.globalArguments.safeParse({ sandboxMode: "docker" }).success,
+    false,
+  );
+});
+
+Deno.test("runModel resolution classifier recognizes safe fallback failures", () => {
+  for (
+    const message of [
+      "model not found",
+      "Cannot invoke model type @mgreten/cli-agent",
+      "add cli-agent to dependencies",
+      "Method arguments validation failed",
+      "Global arguments validation failed: unknown argument prompt",
+    ]
+  ) {
+    assert(isRunModelResolutionFailure(message), message);
+  }
+});
+
+Deno.test("runModel resolution classifier rejects execution failures", () => {
+  for (
+    const message of [
+      "provider quota exhausted",
+      "wall timeout after 300000ms",
+      "agent returned malformed JSON",
+    ]
+  ) {
+    assert(!isRunModelResolutionFailure(message), message);
+  }
+});
+
+Deno.test("normalizeCliAgentArtifact rejects a missing artifact", () => {
+  assertEquals(normalizeCliAgentArtifact(undefined, true), {
+    success: false,
+    output: null,
+    error: "No artifact in response",
+  });
+});
+
+Deno.test("normalizeCliAgentArtifact returns parsed output", () => {
+  assertEquals(
+    normalizeCliAgentArtifact({
+      success: true,
+      rawOutput: '{"summary":"ok"}',
+      parsedResponse: { summary: "ok" },
+    }, true),
+    { success: true, output: { summary: "ok" } },
+  );
+});
+
+Deno.test("normalizeCliAgentArtifact reports missing parsed JSON with bounded raw context", () => {
+  const normalized = normalizeCliAgentArtifact({
+    success: true,
+    rawOutput: "x".repeat(250),
+  }, true);
+  assertEquals(normalized.success, false);
+  assertEquals(normalized.output?.rawOutput, "x".repeat(250));
+  assertEquals(
+    normalized.error,
+    `No parsed JSON in agent output (raw: ${"x".repeat(200)})`,
+  );
+});
+
+Deno.test("normalizeCliAgentArtifact preserves raw failure when parsing is disabled", () => {
+  const artifact = { success: false, rawOutput: "provider failed" };
+  assertEquals(normalizeCliAgentArtifact(artifact, false), {
+    success: false,
+    output: artifact,
+  });
 });

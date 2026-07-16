@@ -388,7 +388,7 @@ export function isRunModelResolutionFailure(message: string): boolean {
  * whether it arrives inline via the CLI run envelope's `dataArtifacts[0]` or
  * is fetched by name after a `runModel` call) into `{ success, output, error }`.
  */
-function normalizeCliAgentArtifact(
+export function normalizeCliAgentArtifact(
   artifact: Record<string, unknown> | undefined,
   parse: boolean,
 ): {
