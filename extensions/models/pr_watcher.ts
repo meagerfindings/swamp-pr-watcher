@@ -775,62 +775,73 @@ async function resolveGithubToken(
   const repoDir = context.globalArgs.subCallRepoDir ||
     `${Deno.env.get("HOME")}/git/agentic-tooling`;
 
-  const result = await runSwampCmd(
-    [
-      "model",
-      "method",
-      "run",
-      "secret-access",
-      "read",
-      "--input",
-      `key=github-${role}-pat`,
-      "--input",
-      `purpose=pr-watcher-${phase}`,
-      "--json",
-    ],
-    repoDir,
-  );
-
-  if (!result.success) {
+  // secret-access reads the PAT from the `watcher-github` swamp vault and
+  // writes it to `outFile` with 0600 perms — it never returns the secret
+  // inline (that would leak it into swamp data artifacts/logs). So we hand it
+  // a private temp file, read the token back out, and delete the file
+  // immediately. The vault is the source of truth; the file is an ephemeral
+  // transport that lives for one read.
+  let outFile: string;
+  try {
+    outFile = await Deno.makeTempFile({ prefix: `pr-watcher-${role}-`, suffix: ".pat" });
+  } catch (e) {
     context.logger.warning(
-      "resolveGithubToken({role}) unavailable, falling back to ambient gh auth: {detail}",
-      {
-        role,
-        detail: (result.stderr || result.stdout).slice(0, 200) ||
-          `exit ${result.code}`,
-      },
+      "resolveGithubToken({role}) could not create temp file, falling back to ambient gh auth: {err}",
+      { role, err: e instanceof Error ? e.message : String(e) },
     );
     return null;
   }
 
   try {
-    const data = JSON.parse(result.stdout);
-    // TODO(secret-access contract): the model isn't finished yet, so this is
-    // a best guess at its --json shape — most likely dataArtifacts[0]
-    // .attributes carrying either the raw token value or a path to a file
-    // containing it. Revisit once secret-access lands and exposes its real
-    // schema; until then any shape mismatch below falls through to the
-    // catch and degrades to null (ambient gh), same as a hard failure.
-    const attrs = data.dataArtifacts?.[0]?.attributes as
-      | Record<string, unknown>
-      | undefined;
-    const token = (attrs?.value ?? attrs?.token ?? attrs?.secret) as
-      | string
-      | undefined;
-    if (typeof token === "string" && token.length > 0) {
+    const result = await runSwampCmd(
+      [
+        "model",
+        "method",
+        "run",
+        "secret-access",
+        "read",
+        "--input",
+        `key=github-${role}-pat`,
+        "--input",
+        `purpose=pr-watcher-${phase}`,
+        "--input",
+        `outFile=${outFile}`,
+        "--json",
+      ],
+      repoDir,
+    );
+
+    if (!result.success) {
+      context.logger.warning(
+        "resolveGithubToken({role}) unavailable, falling back to ambient gh auth: {detail}",
+        {
+          role,
+          detail: (result.stderr || result.stdout).slice(0, 200) ||
+            `exit ${result.code}`,
+        },
+      );
+      return null;
+    }
+
+    const token = (await Deno.readTextFile(outFile)).trim();
+    if (token.length > 0) {
       return token;
     }
     context.logger.warning(
-      "resolveGithubToken({role}) got a response with no recognizable token field, falling back to ambient gh auth",
+      "resolveGithubToken({role}) secret-access wrote an empty token file, falling back to ambient gh auth",
       { role },
     );
     return null;
   } catch (e) {
     context.logger.warning(
-      "resolveGithubToken({role}) failed to parse secret-access response, falling back to ambient gh auth: {err}",
+      "resolveGithubToken({role}) failed reading the token file, falling back to ambient gh auth: {err}",
       { role, err: e instanceof Error ? e.message : String(e) },
     );
     return null;
+  } finally {
+    try {
+      await Deno.remove(outFile);
+    } catch { /* best-effort cleanup */ }
   }
 }
 
@@ -2946,16 +2957,21 @@ export const model = {
           },
         );
 
-        // Actor-scope token for the push. Degrades to null (ambient gh
-        // auth) until the org PATs land — see resolveGithubToken's TODO.
+        // Actor-scope token for the push. FAIL-CLOSED: the actor PAT
+        // (github-actor-pat, write scope) is required to push. If it can't be
+        // resolved from the watcher-github vault, we REFUSE to push rather
+        // than silently fall back to ambient gh auth — an unattended push
+        // must use the scoped, audited actor identity, never whatever
+        // credentials happen to be lying around. (Reader/investigate stays
+        // fail-open: read-only, low risk.)
         const actorToken = await resolveGithubToken("actor", context, "push");
-        const actorEnv = actorToken ? { GH_TOKEN: actorToken } : undefined;
         if (!actorToken) {
-          context.logger.warning(
-            "pushApprovedFix PR #{prNumber}: no actor PAT available, using ambient gh auth (fallback, not fail-closed — TODO once PATs land)",
-            { prNumber: investigation.prNumber },
+          return await fail(
+            "actor-token",
+            "actor PAT unavailable from watcher-github vault — refusing to push (fail-closed)",
           );
         }
+        const actorEnv = { GH_TOKEN: actorToken };
 
         // 1) FRESH worktree — never reuse buildFixCandidate's (already torn
         // down) worktree, so the push side re-verifies everything from a
