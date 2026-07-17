@@ -783,7 +783,10 @@ async function resolveGithubToken(
   // transport that lives for one read.
   let outFile: string;
   try {
-    outFile = await Deno.makeTempFile({ prefix: `pr-watcher-${role}-`, suffix: ".pat" });
+    outFile = await Deno.makeTempFile({
+      prefix: `pr-watcher-${role}-`,
+      suffix: ".pat",
+    });
   } catch (e) {
     context.logger.warning(
       "resolveGithubToken({role}) could not create temp file, falling back to ambient gh auth: {err}",
