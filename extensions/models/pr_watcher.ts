@@ -1097,11 +1097,59 @@ export type FeedbackEvent = {
 };
 
 /**
+ * Select which feed-event artifact NAMES belong to a given PR, purely from the
+ * `data list` result — WITHOUT fetching each artifact.
+ *
+ * Feed events are named `event-<prNumber>-<...>` (verified: every event in the
+ * live feed matches `/^event-(\d+)-/`). When a `prNumber` is supplied we can
+ * therefore pre-filter to just that PR's events by name and skip the per-event
+ * `swamp data get` for all the others — the whole point of the fix for the
+ * O(N) feed scan that used to `data get` all ~500 events to load one PR's ~30.
+ *
+ * The name is a HEURISTIC, not a guarantee — callers still re-check
+ * `attrs.prNumber === prNumber` after fetching (a correctness backstop). This
+ * function only decides which artifacts are worth fetching.
+ *
+ * When `prNumber` is undefined the caller wants ALL events; we return every
+ * `event-*` name unchanged (the historical full-scan path, preserved).
+ *
+ * The `-` boundary is load-bearing: PR 25 must match `event-25-...` but NOT
+ * `event-256-...`, so we match the exact prefix `event-<pr>-`.
+ */
+export function eventNamesForPr(
+  allNames: string[],
+  prNumber?: number,
+): string[] {
+  const eventNames = allNames.filter((n) => n.startsWith("event-"));
+  if (prNumber === undefined) return eventNames;
+  const prefix = `event-${prNumber}-`;
+  return eventNames.filter((n) => n.startsWith(prefix));
+}
+
+/**
+ * Wall-clock budget (ms) for the whole `loadFeedbackEvents` fetch loop. This is
+ * a defense-in-depth safety net: the name pre-filter (see `eventNamesForPr`)
+ * already bounds normal fetches to one PR's events, but the feed is never
+ * pruned and grows without limit, so a pathological case (e.g. a single PR that
+ * has accumulated hundreds of events) could still run long. If the loop exceeds
+ * this budget we stop fetching and return what we have with a logged warning —
+ * failing fast and cleanly rather than being SIGKILL'd mid-write past the
+ * 30-min swamp-watchdog budget. 8 min leaves generous headroom for a legit
+ * large single-PR load while staying well under the watchdog kill.
+ */
+const LOAD_FEEDBACK_BUDGET_MS = 8 * 60 * 1000;
+
+/**
  * Load `event-*` feedback records from the feed model, optionally filtered to a
  * single PR and/or a set of event ids.
+ *
+ * When `prNumber` is provided, only that PR's event artifacts are fetched
+ * (name pre-filter via `eventNamesForPr`) — this avoids the O(N) full-feed
+ * scan. When `prNumber` is undefined the full set of `event-*` artifacts is
+ * loaded (historical behavior, unchanged).
  */
 async function loadFeedbackEvents(
-  _context: MethodContext,
+  context: MethodContext,
   feedModel: string,
   repoDir: string,
   prNumber?: number,
@@ -1121,12 +1169,35 @@ async function loadFeedbackEvents(
       (g: { items: Array<{ name: string }> }) => g.items ?? [],
     );
 
+    // Pre-filter by NAME so we only `data get` the artifacts that could
+    // belong to this PR. Each `data get` is a ~13s CLI catalog-scan, so
+    // fetching only one PR's events (vs. the whole feed) is the difference
+    // between seconds and >30 minutes.
+    const namesToFetch = eventNamesForPr(
+      items.map((i) => i.name),
+      prNumber,
+    );
+
     const events: FeedbackEvent[] = [];
-    for (const item of items) {
-      if (!item.name.startsWith("event-")) continue;
+    const startedAt = Date.now();
+    for (const name of namesToFetch) {
+      // Safety net: bail cleanly if the fetch loop blows its wall budget,
+      // rather than run unbounded and get SIGKILL'd past the watchdog budget.
+      if (Date.now() - startedAt > LOAD_FEEDBACK_BUDGET_MS) {
+        context.logger.warning(
+          "loadFeedbackEvents exceeded its {budgetMs}ms budget after " +
+            "{fetched}/{total} events; returning partial results",
+          {
+            budgetMs: LOAD_FEEDBACK_BUDGET_MS,
+            fetched: events.length,
+            total: namesToFetch.length,
+          },
+        );
+        break;
+      }
 
       const content = await runSwampCmd(
-        ["data", "get", feedModel, item.name, "--json"],
+        ["data", "get", feedModel, name, "--json"],
         repoDir,
       );
       if (!content.success) continue;
@@ -1135,6 +1206,8 @@ async function loadFeedbackEvents(
         const parsed = JSON.parse(content.stdout);
         const attrs = parsed.content ?? parsed.attributes ?? parsed;
 
+        // Correctness backstop: the name is a heuristic, so still confirm the
+        // fetched artifact really is for this PR / these event ids.
         if (prNumber !== undefined && attrs.prNumber !== prNumber) continue;
         if (
           eventIds && eventIds.length > 0 &&
@@ -1730,7 +1803,7 @@ async function sendFixCandidateApprovalNotification(
  */
 export const model = {
   type: "@mgreten/pr-watcher",
-  version: "2026.07.16.2",
+  version: "2026.07.23.1",
   globalArguments: GlobalArgsSchema,
   resources: {
     investigation: {

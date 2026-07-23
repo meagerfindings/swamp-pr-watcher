@@ -15,6 +15,7 @@ import {
   buildInvestigationPrompt,
   canonicalApprovalString,
   computeApprovalHash,
+  eventNamesForPr,
   type FeedbackEvent,
   headHasMoved,
   isExpired,
@@ -915,4 +916,64 @@ Deno.test("normalizeCliAgentArtifact preserves raw failure when parsing is disab
     success: false,
     output: artifact,
   });
+});
+
+// --- eventNamesForPr --------------------------------------------------------
+// Guards the O(N) feed-scan fix: only a single PR's `event-<pr>-*` artifacts
+// should be selected for fetching, never the whole feed.
+
+Deno.test("eventNamesForPr selects only the target PR's events", () => {
+  const names = [
+    "event-25268-abc",
+    "event-25268-def",
+    "event-99999-xyz",
+    "event-1-foo",
+  ];
+  assertEquals(eventNamesForPr(names, 25268), [
+    "event-25268-abc",
+    "event-25268-def",
+  ]);
+});
+
+Deno.test("eventNamesForPr excludes other PRs entirely", () => {
+  const names = ["event-100-a", "event-200-b", "event-300-c"];
+  assertEquals(eventNamesForPr(names, 200), ["event-200-b"]);
+});
+
+Deno.test("eventNamesForPr respects the '-' boundary (PR 25 != 256)", () => {
+  const names = [
+    "event-25-real",
+    "event-256-other",
+    "event-2500-other",
+    "event-25-again",
+  ];
+  assertEquals(eventNamesForPr(names, 25), [
+    "event-25-real",
+    "event-25-again",
+  ]);
+});
+
+Deno.test("eventNamesForPr with undefined prNumber returns all event-* names", () => {
+  const names = [
+    "event-1-a",
+    "event-2-b",
+    "not-an-event",
+    "event-3-c",
+  ];
+  assertEquals(eventNamesForPr(names, undefined), [
+    "event-1-a",
+    "event-2-b",
+    "event-3-c",
+  ]);
+});
+
+Deno.test("eventNamesForPr filters out non-event names in both modes", () => {
+  const names = ["config", "event-5-x", "state", "event-5-y"];
+  assertEquals(eventNamesForPr(names, 5), ["event-5-x", "event-5-y"]);
+  assertEquals(eventNamesForPr(names, undefined), ["event-5-x", "event-5-y"]);
+});
+
+Deno.test("eventNamesForPr returns empty when the PR has no events", () => {
+  const names = ["event-1-a", "event-2-b"];
+  assertEquals(eventNamesForPr(names, 999), []);
 });
