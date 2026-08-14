@@ -69,10 +69,35 @@ const GlobalArgsSchema = z.object({
   ntfyBaseUrl: z.string().default("https://ntfy.sh"),
   /** Extra ntfy tag appended to every notification (e.g. a project label). */
   ntfyExtraTag: z.string().default(""),
-  /** Provider passed to the CLI-agent model for investigations. */
+  /** Provider passed to the CLI-agent model for investigations. Used as the
+   * FALLBACK when the provider catalog is off or unreachable — see
+   * `providerCatalogModel`. */
   investigateProvider: z.string().default("claude"),
-  /** Model id passed to the CLI-agent model for investigations. */
+  /** Model id passed to the CLI-agent model for investigations. Same
+   * fallback-only role as `investigateProvider`. */
   investigateModelId: z.string().default("sonnet"),
+  /** Name of the `@mgreten/agent-provider-catalog` instance that owns the
+   * fleet's provider/model table. Reading {provider, model} from the catalog
+   * instead of hardcoding it here means a fleet-wide provider migration (e.g.
+   * moving off Anthropic onto codex) is ONE catalog edit, not a sweep across
+   * every consumer's globalArgs. */
+  providerCatalogModel: z.string().default("provider-catalog").describe(
+    "Name of the @mgreten/agent-provider-catalog instance holding the fleet's provider/model table. Reading {provider, model} from the catalog instead of hardcoding it makes a fleet-wide provider migration one catalog edit rather than a per-consumer sweep.",
+  ),
+  /** Whether to read {provider, model} from `providerCatalogModel`. On by
+   * default: this phase has no cross-run comparability requirement, so it
+   * should follow the fleet. The read is fail-open — a missing, broken, or
+   * misconfigured catalog silently falls back to `investigateProvider` /
+   * `investigateModelId` rather than taking investigations down. */
+  useProviderCatalog: z.boolean().default(true).describe(
+    "Read {provider, model} from providerCatalogModel instead of investigateProvider/investigateModelId. ON by default so this model follows the fleet. Fail-open: a missing or broken catalog falls back to the literals rather than failing the investigation.",
+  ),
+  /** Role name handed to the catalog's `resolveAgentDispatch`. The catalog's
+   * own roleMap folds it onto an abstract catalog role, so a consumer never
+   * needs to know the catalog's internal role vocabulary. */
+  catalogRole: z.string().default("investigate").describe(
+    "Role name handed to the catalog's resolveAgentDispatch. The catalog's own roleMap folds it onto an abstract role, so this model never needs the catalog's internal role vocabulary.",
+  ),
   /** Wall-clock timeout (ms) for an investigation agent run. */
   investigateTimeoutMs: z.number().default(300_000),
   /** Path to the Todoist `td` CLI used to create approval tasks. */
@@ -466,6 +491,135 @@ export function buildCliAgentInput(
     sandboxMode: opts.sandboxMode,
     sandboxRequired: opts.sandboxRequired,
   };
+}
+
+/**
+ * Scan a `resolveAgentDispatch` payload's data entries for the first one whose
+ * attributes carry BOTH `provider` and `model`, and return them.
+ *
+ * Deliberately a SCAN, not `entries[0]`: the catalog is free to grow its return
+ * envelope (an added audit artifact, a fallback-chain handle), and indexing the
+ * first slot would silently start reading the wrong resource the day it does.
+ * Returns null when nothing in the payload looks like a dispatch.
+ */
+export function extractDispatch(
+  entries: unknown,
+): { provider: string; model: string } | null {
+  if (!Array.isArray(entries)) return null;
+  for (const entry of entries) {
+    // Two shapes carry the payload depending on transport: a method-run --json
+    // envelope nests it under `attributes`, while `swamp data get --json` nests
+    // it under `content`. Accept either so one reader serves both paths.
+    const e = entry as { attributes?: unknown; content?: unknown } | null;
+    const attrs = e?.attributes ?? e?.content;
+    if (!attrs || typeof attrs !== "object") continue;
+    const { provider, model } = attrs as Record<string, unknown>;
+    if (
+      typeof provider === "string" && provider.length > 0 &&
+      typeof model === "string" && model.length > 0
+    ) {
+      return { provider, model };
+    }
+  }
+  return null;
+}
+
+/**
+ * Read the effective `{provider, model}` for one work item + role from the
+ * `@mgreten/agent-provider-catalog` instance named by `providerCatalogModel`.
+ *
+ * WHY: this is the single switch point for the fleet's provider choice. With
+ * every consumer reading the catalog, migrating off one provider onto another
+ * is a one-line catalog edit instead of editing every model's globalArgs.
+ *
+ * FAIL-OPEN by construction: every failure mode — catalog off, missing
+ * instance, `runModel` throw, `ok:false`, malformed payload, absent
+ * provider/model fields — returns null, and the caller falls back to its own
+ * `investigateProvider` / `investigateModelId` defaults. A broken catalog must
+ * never be able to take an investigation down; the worst it can do is leave
+ * this consumer on its previous literal.
+ *
+ * Transport mirrors `invokeCliAgent`: `context.runModel` in-process when the
+ * CLI provides it, otherwise the same `swamp model method run --json` shellout
+ * scoped to the same `subCallRepoDir`-derived repo dir.
+ */
+export async function resolveDispatch(
+  g: z.infer<typeof GlobalArgsSchema>,
+  context: MethodContext | undefined,
+  workItem: string,
+  role: string,
+): Promise<{ provider: string; model: string } | null> {
+  if (!g.useProviderCatalog) return null;
+
+  const args = {
+    workItem,
+    role,
+    instanceName: g.cliAgentModel,
+    attempt: 1,
+  };
+
+  try {
+    if (context && typeof context.runModel === "function") {
+      const runResult = await context.runModel({
+        definition: g.providerCatalogModel,
+        method: "resolveAgentDispatch",
+        arguments: args,
+      });
+      // A hard failure is authoritative: stay on the fallback values.
+      if (!runResult.ok) return null;
+      // DataHandle is metadata-only — name/specName/dataId/version, NO
+      // `attributes`. (The type is loose enough that reading .attributes
+      // compiles and then silently yields undefined at runtime; an earlier
+      // version of this function did exactly that and so never resolved a
+      // provider at all.) Read the resource back BY NAME, mirroring the
+      // cli-agent read-back below — re-running resolveAgentDispatch through the
+      // shellout instead would execute the catalog method a second time on
+      // every single invocation.
+      const handle = runResult.resources[0];
+      if (!handle) return null;
+      // The in-process run wrote to THIS repo's datastore (the parent), not
+      // subCallRepoDir — read it back from the ambient repo.
+      const readBack = await runSwampCmd(
+        ["data", "get", g.providerCatalogModel, handle.name, "--json"],
+        resolveRepoDir(),
+      );
+      if (!readBack.success) return null;
+      const record = JSON.parse(readBack.stdout);
+      return extractDispatch([record, ...(record?.versions ?? [])]);
+    }
+
+    // Shellout fallback (older CLI, or a catalog in a foreign repo) — same
+    // transport shape the cli-agent invocation uses.
+    const repoDir = g.subCallRepoDir || resolveRepoDir();
+    const inputFile = await Deno.makeTempFile({ suffix: ".json" });
+    try {
+      await Deno.writeTextFile(inputFile, JSON.stringify(args));
+      const result = await runSwampCmd(
+        [
+          "model",
+          "method",
+          "run",
+          g.providerCatalogModel,
+          "resolveAgentDispatch",
+          "--input-file",
+          inputFile,
+          "--json",
+        ],
+        repoDir,
+      );
+      if (!result.success) return null;
+      const data = JSON.parse(result.stdout);
+      if (data.error || data.status === "failed") return null;
+      return extractDispatch(data.dataArtifacts ?? data.dataHandles);
+    } finally {
+      try {
+        await Deno.remove(inputFile);
+      } catch { /* cleanup */ }
+    }
+  } catch {
+    // Fail-open: any throw at all leaves the caller on its own defaults.
+    return null;
+  }
 }
 
 /**
@@ -1542,6 +1696,7 @@ async function runInvestigation(
     subCallRepoDir,
     sandboxMode,
     sandboxRequired,
+    catalogRole,
   } = context.globalArgs;
 
   const repoDir = resolveRepoDir();
@@ -1621,13 +1776,42 @@ async function runInvestigation(
     { embeddedDiff, grounding: worktree.grounding },
   );
 
+  // Ask the provider catalog what this role should run on. Fail-open: null
+  // (catalog off, unreachable, or malformed) keeps the globalArg literals.
+  const dispatch = await resolveDispatch(
+    context.globalArgs,
+    context,
+    `pr-${prNumber}`,
+    catalogRole,
+  );
+  if (dispatch) {
+    context.logger.info(
+      "Provider catalog resolved {provider}/{model} for role {role}",
+      { provider: dispatch.provider, model: dispatch.model, role: catalogRole },
+    );
+  } else if (context.globalArgs.useProviderCatalog) {
+    // Log the DEGRADED case too. Without this, "the catalog moved us to codex"
+    // and "the catalog never answered so we stayed on claude" are
+    // indistinguishable in the log — and since the read is fail-open, the
+    // second one is silent by construction. An operator debugging a
+    // misconfigured catalog needs to see that it was asked and did not answer.
+    context.logger.info(
+      "Provider catalog unavailable for role {role}; using {provider}/{model}",
+      {
+        role: catalogRole,
+        provider: investigateProvider,
+        model: investigateModelId,
+      },
+    );
+  }
+
   const agentResult = await invokeCliAgent(
     cliAgentModel,
     agentRepoDir,
     {
       prompt,
-      provider: investigateProvider,
-      model: investigateModelId,
+      provider: dispatch?.provider ?? investigateProvider,
+      model: dispatch?.model ?? investigateModelId,
       cwd: worktree.cwd,
       tags: {
         phase: "pr-watch-investigate",
@@ -1803,7 +1987,7 @@ async function sendFixCandidateApprovalNotification(
  */
 export const model = {
   type: "@mgreten/pr-watcher",
-  version: "2026.07.23.1",
+  version: "2026.07.31.1",
   globalArguments: GlobalArgsSchema,
   resources: {
     investigation: {

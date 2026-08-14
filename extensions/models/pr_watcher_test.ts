@@ -16,6 +16,7 @@ import {
   canonicalApprovalString,
   computeApprovalHash,
   eventNamesForPr,
+  extractDispatch,
   type FeedbackEvent,
   headHasMoved,
   isExpired,
@@ -24,6 +25,7 @@ import {
   MAX_EMBEDDED_DIFF_CHARS,
   model,
   normalizeCliAgentArtifact,
+  resolveDispatch,
   resolveRepoDir,
   truncateEmbeddedDiff,
 } from "./pr_watcher.ts";
@@ -335,7 +337,10 @@ Deno.test("diff at the cap passes through untouched", () => {
 
 Deno.test("diff over the cap is sliced with an explicit marker", () => {
   const out = truncateEmbeddedDiff("x".repeat(MAX_EMBEDDED_DIFF_CHARS + 1));
-  assertStringIncludes(out, `[... diff truncated at ${MAX_EMBEDDED_DIFF_CHARS} chars ...]`);
+  assertStringIncludes(
+    out,
+    `[... diff truncated at ${MAX_EMBEDDED_DIFF_CHARS} chars ...]`,
+  );
   assert(out.startsWith("x".repeat(100)));
   assertEquals(
     out.indexOf("\n[... diff truncated"),
@@ -367,9 +372,11 @@ Deno.test("fail-closed sandbox error matches the halt signature", () => {
 });
 
 Deno.test("routine agent failures do not match the halt signature", () => {
-  assert(!isSandboxFailClosedError(
-    "No parseable JSON in output (We're on master, not the PR branch...)",
-  ));
+  assert(
+    !isSandboxFailClosedError(
+      "No parseable JSON in output (We're on master, not the PR branch...)",
+    ),
+  );
   assert(!isSandboxFailClosedError("wall timeout after 600000ms"));
   assert(!isSandboxFailClosedError("unknown error"));
 });
@@ -696,6 +703,191 @@ Deno.test("global args accept off to opt out of sandboxing entirely", () => {
   assertEquals(parsed.sandboxMode, "off");
 });
 
+// --- Provider catalog read (resolveDispatch / extractDispatch) --------------
+//
+// The catalog is the fleet's single switch point for {provider, model}. These
+// cover both halves of the contract: the successful read overrides the
+// globalArg literals, and EVERY failure mode is fail-open (null), because a
+// broken catalog must never be able to take an investigation down.
+
+/** Global args with the catalog on, as a live instance would have them. */
+function catalogGlobalArgs(overrides: Record<string, unknown> = {}) {
+  return model.globalArguments.parse({
+    cliAgentModel: "cli-agent",
+    providerCatalogModel: "provider-catalog",
+    ...overrides,
+  });
+}
+
+/**
+ * Fake MethodContext exposing only `runModel`, recording each call so a test
+ * can assert the catalog was (or was NOT) consulted.
+ */
+function makeRunModelContext(
+  impl: (options: { definition: string; method: string }) => unknown,
+): { context: unknown; calls: Array<{ definition: string; method: string }> } {
+  const calls: Array<{ definition: string; method: string }> = [];
+  const context = {
+    runModel: (
+      options: { definition: string; method: string; arguments?: unknown },
+    ) => {
+      calls.push({ definition: options.definition, method: options.method });
+      return Promise.resolve(impl(options));
+    },
+  };
+  return { context, calls };
+}
+
+Deno.test("extractDispatch reads provider/model from a method-run envelope entry", () => {
+  // The parsing contract, tested on the function that owns it. Driving this
+  // through resolveDispatch would require faking a runModel payload carrying
+  // `attributes`, a shape the real runtime never produces — see the regression
+  // guard below.
+  assertEquals(
+    extractDispatch([{
+      name: "agent-dispatch-pr-42-investigate-1",
+      attributes: { provider: "codex", model: "gpt-5-codex", tier: 0 },
+    }]),
+    { provider: "codex", model: "gpt-5-codex" },
+  );
+});
+
+Deno.test("extractDispatch also reads the `content` shape `swamp data get` returns", () => {
+  // The in-process path reads the resource back by name, and `data get --json`
+  // nests the payload under `content` rather than `attributes`.
+  assertEquals(
+    extractDispatch([{
+      name: "agent-dispatch-pr-42-investigate-1",
+      content: { provider: "codex", model: "gpt-5-codex", tier: 0 },
+    }]),
+    { provider: "codex", model: "gpt-5-codex" },
+  );
+});
+
+Deno.test("extractDispatch scans past non-dispatch entries instead of indexing [0]", () => {
+  // An added audit artifact must not shift the payload out from under us.
+  assertEquals(
+    extractDispatch([
+      { name: "catalog-audit-pr-42", attributes: { note: "audited" } },
+      { name: "no-attributes-at-all" },
+      {
+        name: "agent-dispatch-pr-42-investigate-1",
+        attributes: { provider: "codex", model: "gpt-5-codex" },
+      },
+    ]),
+    { provider: "codex", model: "gpt-5-codex" },
+  );
+});
+
+Deno.test("resolveDispatch never reads the values off runModel's own payload", async () => {
+  // REGRESSION GUARD. runModel resolves to {ok, resources:[{specName, name}]} —
+  // a DataHandle is metadata-only and carries NO `attributes`. An earlier
+  // version did `return extractDispatch(run.resources)`, which therefore always
+  // yielded null, so the catalog silently never applied. Asserting against the
+  // REALISTIC name-only shape is what keeps that bug from returning; the two
+  // tests this replaced mocked `attributes` onto resources and so passed while
+  // the bug was live.
+  //
+  // With a name-only payload the function must NOT invent a value from it. It
+  // proceeds to read the handle back by name, which in a unit test resolves to
+  // no catalog and fails open to null.
+  const { context, calls } = makeRunModelContext(() => ({
+    ok: true,
+    resources: [
+      { specName: "agentDispatch", name: "agent-dispatch-pr-42-investigate-1" },
+    ],
+  }));
+  const dispatch = await resolveDispatch(
+    catalogGlobalArgs(),
+    // deno-lint-ignore no-explicit-any
+    context as any,
+    "pr-42",
+    "investigate",
+  );
+  assertEquals(dispatch, null);
+  assertEquals(calls, [{
+    definition: "provider-catalog",
+    method: "resolveAgentDispatch",
+  }]);
+});
+
+Deno.test("resolveDispatch fails open (null) when runModel throws", async () => {
+  const { context } = makeRunModelContext(() => {
+    throw new Error("catalog instance not found");
+  });
+  const dispatch = await resolveDispatch(
+    catalogGlobalArgs(),
+    // deno-lint-ignore no-explicit-any
+    context as any,
+    "pr-42",
+    "investigate",
+  );
+  assertEquals(dispatch, null);
+});
+
+Deno.test("resolveDispatch fails open (null) on an ok:false catalog result", async () => {
+  const { context } = makeRunModelContext(() => ({
+    ok: false,
+    error: { message: 'unknown role "investigate"' },
+  }));
+  const dispatch = await resolveDispatch(
+    catalogGlobalArgs(),
+    // deno-lint-ignore no-explicit-any
+    context as any,
+    "pr-42",
+    "investigate",
+  );
+  assertEquals(dispatch, null);
+});
+
+Deno.test("resolveDispatch fails open (null) on a malformed payload missing model", async () => {
+  const { context } = makeRunModelContext(() => ({
+    ok: true,
+    resources: [{ name: "agent-dispatch", attributes: { provider: "codex" } }],
+  }));
+  const dispatch = await resolveDispatch(
+    catalogGlobalArgs(),
+    // deno-lint-ignore no-explicit-any
+    context as any,
+    "pr-42",
+    "investigate",
+  );
+  assertEquals(dispatch, null);
+});
+
+Deno.test("resolveDispatch does not consult the catalog when useProviderCatalog is false", async () => {
+  const { context, calls } = makeRunModelContext(() => ({
+    ok: true,
+    resources: [{ attributes: { provider: "codex", model: "gpt-5-codex" } }],
+  }));
+  const dispatch = await resolveDispatch(
+    catalogGlobalArgs({ useProviderCatalog: false }),
+    // deno-lint-ignore no-explicit-any
+    context as any,
+    "pr-42",
+    "investigate",
+  );
+  assertEquals(dispatch, null);
+  assertEquals(calls.length, 0);
+});
+
+Deno.test("global args default the catalog on with the investigate role", () => {
+  const parsed = model.globalArguments.parse({});
+  assertEquals(parsed.useProviderCatalog, true);
+  assertEquals(parsed.providerCatalogModel, "provider-catalog");
+  assertEquals(parsed.catalogRole, "investigate");
+  // The literals stay as the fail-open fallback, unchanged.
+  assertEquals(parsed.investigateProvider, "claude");
+  assertEquals(parsed.investigateModelId, "sonnet");
+});
+
+Deno.test("extractDispatch ignores non-array and empty payloads", () => {
+  assertEquals(extractDispatch(undefined), null);
+  assertEquals(extractDispatch(null), null);
+  assertEquals(extractDispatch({}), null);
+  assertEquals(extractDispatch([]), null);
+});
+
 // --- buildInvestigateHaltNotification ---------------------------------------
 //
 // The fail-closed halt notify is the one failure mode that must never go
@@ -765,21 +957,27 @@ Deno.test("investigation resource schema rejects action confidence outside 0..1"
 
 Deno.test("action resource schema enforces decision enum", () => {
   const schema = model.resources.action.schema;
-  assertEquals(schema.safeParse({
-    actionId: "action-1",
-    investigationId: "inv-42",
-    prNumber: 42,
-    eventIds: ["event-1"],
-    decision: "approved",
-    approvalHash: "abc",
-  }).success, true);
-  assertEquals(schema.safeParse({
-    actionId: "action-1",
-    investigationId: "inv-42",
-    prNumber: 42,
-    eventIds: [],
-    decision: "silently_ship",
-  }).success, false);
+  assertEquals(
+    schema.safeParse({
+      actionId: "action-1",
+      investigationId: "inv-42",
+      prNumber: 42,
+      eventIds: ["event-1"],
+      decision: "approved",
+      approvalHash: "abc",
+    }).success,
+    true,
+  );
+  assertEquals(
+    schema.safeParse({
+      actionId: "action-1",
+      investigationId: "inv-42",
+      prNumber: 42,
+      eventIds: [],
+      decision: "silently_ship",
+    }).success,
+    false,
+  );
 });
 
 Deno.test("fixRun resource schema preserves nullable phase boundaries", () => {
@@ -821,7 +1019,10 @@ Deno.test("fixCandidate resource schema requires build and test outcomes", () =>
     buildOk: true,
     testOk: true,
   };
-  assertEquals(model.resources.fixCandidate.schema.safeParse(candidate).success, true);
+  assertEquals(
+    model.resources.fixCandidate.schema.safeParse(candidate).success,
+    true,
+  );
   const { testOk: _omitted, ...missingOutcome } = candidate;
   assertEquals(
     model.resources.fixCandidate.schema.safeParse(missingOutcome).success,
@@ -831,16 +1032,19 @@ Deno.test("fixCandidate resource schema requires build and test outcomes", () =>
 
 Deno.test("method argument schemas enforce non-empty batch and required IDs", () => {
   assertEquals(
-    model.methods.investigateBatch.arguments.safeParse({ prNumbers: [] }).success,
+    model.methods.investigateBatch.arguments.safeParse({ prNumbers: [] })
+      .success,
     false,
   );
   assertEquals(
-    model.methods.investigateBatch.arguments.safeParse({ prNumbers: [1, 2] }).success,
+    model.methods.investigateBatch.arguments.safeParse({ prNumbers: [1, 2] })
+      .success,
     true,
   );
   assertEquals(model.methods.notify.arguments.safeParse({}).success, false);
   assertEquals(
-    model.methods.notify.arguments.safeParse({ investigationId: "inv-42" }).success,
+    model.methods.notify.arguments.safeParse({ investigationId: "inv-42" })
+      .success,
     true,
   );
 });
